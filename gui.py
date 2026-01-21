@@ -4,7 +4,7 @@ import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk
-from utils import VERSION, OS_NAME, ALL_MODELS, DEFAULT_PORT, STEREO_MIX_NAMES, DISABLE_TRT_KEYWORDS, crop_icon, get_local_ip, shutdown_event
+from utils import VERSION, OS_NAME, ALL_MODELS, DEFAULT_PORT, STEREO_MIX_NAMES, DISABLE_TRT_KEYWORDS, crop_icon, get_local_ip, shutdown_event, is_onnx_model
 
 # Get model lists
 DEFAULT_MODEL_LIST = list(ALL_MODELS.keys())
@@ -154,8 +154,9 @@ DEFAULTS = {
     "torch.compile": False,
     "TensorRT": False,
     "Recompile TensorRT": False,
+    "Use ONNX": False,
+    "ONNX Model Path": "",
     "Unlock Thread (Legacy Streamer)": False,
-    "Recompile TensorRT": False,
     "Download Path": "models",
     "HF Endpoint": "https://hf-mirror.com",
     "Computing Device": 0,
@@ -195,6 +196,12 @@ UI_TEXTS = {
         "FP16": "FP16",
         "Inference Optimizer:": "Inference Optimizer:",
         "Recompile TensorRT": "Recompile TensorRT",
+        "Use ONNX": "Use ONNX",
+        "ONNX Model:": "ONNX Model:",
+        "Browse ONNX...": "Browse ONNX...",
+        "Select ONNX Model": "Select ONNX Model",
+        "ONNX Model Selected": "ONNX Model Selected",
+        "Clear ONNX": "Clear",
         "Unlock Thread (Legacy Streamer)": "Unlock Thread (Legacy Streamer)",
         "Download Path:": "Download Path:",
         "Browse...": "Browse...",
@@ -273,6 +280,12 @@ UI_TEXTS = {
         "FP16": "半精度浮点 (F16)",
         "Inference Optimizer:": "推理优化:",
         "Recompile TensorRT": "重新编译TensorRT",
+        "Use ONNX": "使用ONNX",
+        "ONNX Model:": "ONNX模型:",
+        "Browse ONNX...": "浏览ONNX...",
+        "Select ONNX Model": "选择ONNX模型",
+        "ONNX Model Selected": "ONNX模型已选择",
+        "Clear ONNX": "清除",
         "Unlock Thread (Legacy Streamer)": "解锁线程 (旧网络推流)",
         "Download Path:": "下载路径:",
         "Browse...": "浏览...",
@@ -614,31 +627,54 @@ class ConfigGUI(tk.Tk):
         self.depth_model_cb = ttk.Combobox(self.content_frame, textvariable=self.depth_model_var, values=self.loaded_model_list, state="normal")
         self.depth_model_cb.grid(row=13, column=1, columnspan=2, sticky="ew", **self.pad)
         self.depth_model_cb.bind("<<ComboboxSelected>>", self.on_depth_model_change)
+        
+        # ONNX Model Path (Browse button next to depth model)
+        self.btn_browse_onnx = ttk.Button(self.content_frame, text="Browse ONNX...", command=self.browse_onnx_model)
+        self.btn_browse_onnx.grid(row=13, column=3, sticky="ew", **self.pad)
+        
+        # ONNX Model controls (row for ONNX path display and clear button)
+        self.use_onnx_var = tk.BooleanVar()
+        self.onnx_model_path_var = tk.StringVar()
+        
+        self.label_onnx_model = ttk.Label(self.content_frame, text="ONNX Model:")
+        self.label_onnx_model.grid(row=14, column=0, sticky="w", **self.pad)
+        self.label_onnx_model.grid_remove()  # Initially hidden
+        
+        self.onnx_model_entry = ttk.Entry(self.content_frame, textvariable=self.onnx_model_path_var, state="readonly")
+        self.onnx_model_entry.grid(row=14, column=1, columnspan=2, sticky="ew", **self.pad)
+        self.onnx_model_entry.grid_remove()  # Initially hidden
+        
+        self.btn_clear_onnx = ttk.Button(self.content_frame, text="Clear", command=self.clear_onnx_model)
+        self.btn_clear_onnx.grid(row=14, column=3, sticky="ew", **self.pad)
+        self.btn_clear_onnx.grid_remove()  # Initially hidden
+        
+        # Trace ONNX model path changes
+        self.onnx_model_path_var.trace_add("write", self.on_onnx_model_change)
 
-        # Add Inference Optimizer dropdown after Device selection
+        # Add Inference Optimizer dropdown after Device selection (moved to row 15)
         self.use_torch_compile = tk.BooleanVar()
         self.use_tensorrt = tk.BooleanVar()
         self.unlock_streamer_thread = tk.BooleanVar()
         self.label_inference_optimizer = ttk.Label(self.content_frame, text="Inference Optimizer:")
-        self.label_inference_optimizer.grid(row=14, column=0, sticky="w", **self.pad)
+        self.label_inference_optimizer.grid(row=15, column=0, sticky="w", **self.pad)
 
         # Torch Compile
         self.check_torch_compile = ttk.Checkbutton(self.content_frame, text="torch.compile", variable=self.use_torch_compile)
-        self.check_torch_compile.grid(row=14, column=1, sticky="w", **self.pad)
+        self.check_torch_compile.grid(row=15, column=1, sticky="w", **self.pad)
 
         # TensorRT
         self.check_tensorrt = ttk.Checkbutton(self.content_frame, text="TensorRT", variable=self.use_tensorrt)
-        self.check_tensorrt.grid(row=14, column=2, sticky="w", **self.pad)
+        self.check_tensorrt.grid(row=15, column=2, sticky="w", **self.pad)
 
         # Unlock Thread (Legacy Streamer)
         self.check_unlock_streamer_thread = ttk.Checkbutton(self.content_frame, text="Unlock Thread (Legacy Streamer)", variable=self.unlock_streamer_thread)
-        self.check_unlock_streamer_thread.grid(row=14, column=1, sticky="w", **self.pad)
+        self.check_unlock_streamer_thread.grid(row=15, column=1, sticky="w", **self.pad)
         self.use_tensorrt.trace_add("write", self.update_recompile_trt_visibility)
         
         # Recompile TensorRT (only visible when TensorRT is selected)
         self.recompile_trt_var = tk.BooleanVar()
         self.check_recompile_trt = ttk.Checkbutton(self.content_frame, text="Recompile TensorRT", variable=self.recompile_trt_var)
-        self.check_recompile_trt.grid(row=14, column=3, sticky="w", **self.pad)
+        self.check_recompile_trt.grid(row=15, column=3, sticky="w", **self.pad)
         
         # Add these instance variables
         self.specify_display_var = tk.BooleanVar()
@@ -647,33 +683,33 @@ class ConfigGUI(tk.Tk):
         
         # Specify Display (checkbox)
         self.label_specify_display = ttk.Label(self.content_frame, text="Stereo Display Settings:")
-        self.label_specify_display.grid(row=15, column=0, sticky="w", **self.pad)
+        self.label_specify_display.grid(row=16, column=0, sticky="w", **self.pad)
         self.specify_display_cb = ttk.Checkbutton(
             self.content_frame, 
             text="Specify Display",
             variable=self.specify_display_var
         )
         # Initially hidden, will be shown for specific modes
-        self.specify_display_cb.grid(row=15, column=1, sticky="w", **self.pad)
+        self.specify_display_cb.grid(row=16, column=1, sticky="w", **self.pad)
         self.specify_display_cb.grid_remove()
         
         # Stereo Monitor (monitor dropdown)
         self.label_stereo_monitor = ttk.Label(self.content_frame, text="Stereo Monitor:")
-        self.label_stereo_monitor.grid(row=15, column=2, sticky="w", **self.pad)
+        self.label_stereo_monitor.grid(row=16, column=2, sticky="w", **self.pad)
         self.label_stereo_monitor.grid_remove()
         
         self.stereo_monitor_menu = ttk.OptionMenu(self.content_frame, self.stereo_monitor_var, "")
-        self.stereo_monitor_menu.grid(row=15, column=3, sticky="ew", **self.pad)
+        self.stereo_monitor_menu.grid(row=16, column=3, sticky="ew", **self.pad)
         self.stereo_monitor_menu.grid_remove()
         self.specify_display_var.trace_add("write", self.update_stereo_monitor_display)
         
         # HF Endpoint
         self.label_hf_endpoint = ttk.Label(self.content_frame, text="HF Endpoint:")
-        self.label_hf_endpoint.grid(row=16, column=0, sticky="w", **self.pad)
+        self.label_hf_endpoint.grid(row=17, column=0, sticky="w", **self.pad)
         self.hf_endpoint_var = tk.StringVar()
         self.hf_endpoint_cb = ttk.Combobox(self.content_frame, textvariable=self.hf_endpoint_var, state="normal")
         self.hf_endpoint_cb["values"] = ["https://huggingface.co", "https://hf-mirror.com"]
-        self.hf_endpoint_cb.grid(row=16, column=1, sticky="ew", **self.pad)
+        self.hf_endpoint_cb.grid(row=17, column=1, sticky="ew", **self.pad)
         
         # Streamer Port (only visible when run mode is streamer)
         self.label_streamer_port = ttk.Label(self.content_frame, text="Streamer Port:")
@@ -722,13 +758,13 @@ class ConfigGUI(tk.Tk):
 
         # Buttons (moved down a bit to make room)
         self.btn_reset = ttk.Button(self.content_frame, text="Reset", command=self.reset_to_defaults)
-        self.btn_reset.grid(row=13, column=3, sticky="ew", **self.pad)
+        self.btn_reset.grid(row=18, column=1, sticky="ew", **self.pad)
         
         self.btn_stop = ttk.Button(self.content_frame, text="Stop", command=self.stop_process)
-        self.btn_stop.grid(row=16, column=2, sticky="ew", **self.pad)
+        self.btn_stop.grid(row=18, column=2, sticky="ew", **self.pad)
         
         self.btn_run = ttk.Button(self.content_frame, text="Run", command=self.save_settings)
-        self.btn_run.grid(row=16, column=3, sticky="ew", **self.pad)
+        self.btn_run.grid(row=18, column=3, sticky="ew", **self.pad)
         
         # Column weights inside content frame
         for col in range(5):
@@ -758,8 +794,12 @@ class ConfigGUI(tk.Tk):
             """Disable TensorRT option for specific model types"""
             model_lower = model_name.lower()
             
-            # Check if any keyword is in the model name
+            # Check if any keyword is in the model name (including .onnx)
             should_disable = any(keyword in model_lower for keyword in DISABLE_TRT_KEYWORDS)
+            
+            # Also disable for ONNX models
+            if is_onnx_model(model_name):
+                should_disable = True
             
             # Update TensorRT checkbox state
             if should_disable:
@@ -775,6 +815,60 @@ class ConfigGUI(tk.Tk):
                 self.check_recompile_trt.config(state="normal")
                 # Update recompile visibility based on current TensorRT selection
                 self.update_recompile_trt_visibility()
+    
+    def browse_onnx_model(self):
+        """Open file dialog to select ONNX model file"""
+        texts = UI_TEXTS[self.language]
+        filetypes = [("ONNX Models", "*.onnx"), ("All files", "*.*")]
+        filepath = filedialog.askopenfilename(
+            title=texts.get("Select ONNX Model", "Select ONNX Model"),
+            filetypes=filetypes
+        )
+        if filepath:
+            # Set the ONNX model path
+            self.onnx_model_path_var.set(filepath)
+            self.use_onnx_var.set(True)
+            # Update status
+            self.update_status(f"{texts.get('ONNX Model Selected', 'ONNX Model Selected')}: {os.path.basename(filepath)}")
+    
+    def clear_onnx_model(self):
+        """Clear the ONNX model selection"""
+        self.onnx_model_path_var.set("")
+        self.use_onnx_var.set(False)
+        # Hide ONNX path display
+        self.label_onnx_model.grid_remove()
+        self.onnx_model_entry.grid_remove()
+        self.btn_clear_onnx.grid_remove()
+        # Update TensorRT visibility
+        self.update_tensorrt_visibility_based_on_model(self.depth_model_var.get())
+    
+    def on_onnx_model_change(self, *args):
+        """Handle changes to ONNX model path"""
+        onnx_path = self.onnx_model_path_var.get()
+        if onnx_path and is_onnx_model(onnx_path):
+            # Show ONNX path display
+            self.label_onnx_model.grid()
+            self.onnx_model_entry.grid()
+            self.btn_clear_onnx.grid()
+            
+            # Disable TensorRT and torch.compile for ONNX models
+            self.use_tensorrt.set(False)
+            self.use_torch_compile.set(False)
+            self.check_tensorrt.config(state="disabled")
+            self.check_torch_compile.config(state="disabled")
+            self.check_recompile_trt.grid_remove()
+        else:
+            # Hide ONNX path display
+            self.label_onnx_model.grid_remove()
+            self.onnx_model_entry.grid_remove()
+            self.btn_clear_onnx.grid_remove()
+            
+            # Re-enable TensorRT and torch.compile
+            if "CUDA" in self.device_var.get():
+                self.check_tensorrt.config(state="normal")
+                self.check_torch_compile.config(state="normal")
+                # Update TensorRT visibility based on model
+                self.update_tensorrt_visibility_based_on_model(self.depth_model_var.get())
     
     # Support for lossless scaling
     def update_lossless_scaling_visibility(self):
@@ -1198,6 +1292,10 @@ class ConfigGUI(tk.Tk):
         self.label_hf_endpoint.config(text=texts["HF Endpoint:"])
         self.label_device.config(text=texts["Computing Device:"])
         self.btn_browse.config(text=texts["Browse..."])
+        # ONNX-related texts
+        self.btn_browse_onnx.config(text=texts.get("Browse ONNX...", "Browse ONNX..."))
+        self.label_onnx_model.config(text=texts.get("ONNX Model:", "ONNX Model:"))
+        self.btn_clear_onnx.config(text=texts.get("Clear ONNX", "Clear"))
         self.btn_reset.config(text=texts["Reset"])
         self.btn_stop.config(text=texts["Stop"])
         self.btn_run.config(text=texts["Run"])
@@ -1666,6 +1764,13 @@ class ConfigGUI(tk.Tk):
         # Trigger device change to update optimizer options
         self.recompile_trt_var.set(cfg.get("Recompile TensorRT", DEFAULTS["Recompile TensorRT"]))
         
+        # Load ONNX settings
+        self.use_onnx_var.set(cfg.get("Use ONNX", DEFAULTS.get("Use ONNX", False)))
+        onnx_path = cfg.get("ONNX Model Path", DEFAULTS.get("ONNX Model Path", ""))
+        self.onnx_model_path_var.set(onnx_path)
+        # Trigger ONNX model change to update UI visibility
+        self.on_onnx_model_change()
+        
         # Trigger device change to update optimizer options
         self.on_device_change()
 
@@ -1760,7 +1865,8 @@ class ConfigGUI(tk.Tk):
             "IPD": float(self.ipd_var.get()),
             "Display Mode": self.display_mode_cb.get(),
             "Model List": ALL_MODELS,  # Preserve existing model list structure
-            "Depth Model": self.depth_model_var.get(),
+            # Use ONNX model path as Depth Model if ONNX is enabled
+            "Depth Model": self.onnx_model_path_var.get() if self.use_onnx_var.get() and self.onnx_model_path_var.get() else self.depth_model_var.get(),
             "Depth Strength": float(self.depth_strength_cb.get()),
             "Anti-aliasing": int(self.antialiasing_cb.get()),
             "Foreground Scale": float(self.foreground_scale_cb.get()),
@@ -1777,6 +1883,8 @@ class ConfigGUI(tk.Tk):
             "torch.compile": self.use_torch_compile.get(),
             "TensorRT": self.use_tensorrt.get(),
             "Recompile TensorRT": self.recompile_trt_var.get(),
+            "Use ONNX": self.use_onnx_var.get(),
+            "ONNX Model Path": self.onnx_model_path_var.get(),
             "Unlock Thread (Legacy Streamer)": self.unlock_streamer_thread.get(),
             "Capture Tool": self.capture_tool_cb.get(),
             "Fill 16:9": self.fill_16_9_var.get(),

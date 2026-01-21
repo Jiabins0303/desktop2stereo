@@ -1,13 +1,21 @@
 # depth.py
 import torch
 torch.set_num_threads(1)
-from utils import DEVICE_ID, MODEL_ID, CACHE_PATH, FP16, DEPTH_RESOLUTION, AA_STRENGTH, FOREGROUND_SCALE, USE_TORCH_COMPILE, USE_TENSORRT, RECOMPILE_TRT, FILL_16_9, OS_NAME
+from utils import DEVICE_ID, MODEL_ID, CACHE_PATH, FP16, DEPTH_RESOLUTION, AA_STRENGTH, FOREGROUND_SCALE, USE_TORCH_COMPILE, USE_TENSORRT, RECOMPILE_TRT, FILL_16_9, OS_NAME, is_onnx_model, USE_ONNX, ONNX_MODEL_PATH
 import torch.nn.functional as F
 from transformers import AutoModelForDepthEstimation
 import numpy as np
 from threading import Lock
 import cv2
 import os, warnings
+
+# ONNX Runtime for direct ONNX model inference
+try:
+    import onnxruntime as ort
+    ONNXRUNTIME_AVAILABLE = True
+except ImportError:
+    ONNXRUNTIME_AVAILABLE = False
+    print("[Warning] onnxruntime not available. ONNX models will not be supported.")
 
 # Initialize DirectML Device
 def get_device(index=0):
@@ -443,12 +451,108 @@ class TensorRTEngine:
         # Return the main output (predicted_depth)
         return outputs['predicted_depth']
 
+
+# ONNX Runtime Model Wrapper Class for GPU Inference
+class ONNXModelWrapper:
+    """
+    Wrapper for ONNX model inference using TensorRT Execution Provider.
+    Supports INT8 QDQ models with native INT8 kernel acceleration.
+    """
+    def __init__(self, onnx_path, device_id=0, dtype=torch.float32):
+        if not ONNXRUNTIME_AVAILABLE:
+            raise ImportError("onnxruntime-gpu is required. Install with: pip install onnxruntime-gpu")
+        
+        self.device_id = device_id
+        self.dtype = dtype
+        self.device = torch.device(f'cuda:{device_id}')
+        
+        # Engine cache directory (same folder as ONNX model)
+        cache_dir = os.path.dirname(os.path.abspath(onnx_path))
+        
+        # TensorRT EP options for INT8 QDQ models
+        providers = [
+            ('TensorrtExecutionProvider', {
+                'device_id': device_id,
+                'trt_max_workspace_size': 4 * 1024 * 1024 * 1024,  # 4GB
+                'trt_fp16_enable': True,
+                'trt_int8_enable': True,  # Critical for INT8 QDQ models
+                'trt_engine_cache_enable': True,
+                'trt_engine_cache_path': cache_dir,
+            }),
+            ('CUDAExecutionProvider', {'device_id': device_id}),  # Fallback
+        ]
+        
+        # Session options
+        sess_options = ort.SessionOptions()
+        sess_options.log_severity_level = 2  # WARNING level
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        
+        # Load model from file path (required for TRT engine caching)
+        print(f"[ONNX] Loading model: {onnx_path}")
+        print(f"[ONNX] TensorRT engine cache: {cache_dir}")
+        print(f"[ONNX] First run may take several minutes for TensorRT compilation...")
+        
+        self.session = ort.InferenceSession(onnx_path, sess_options=sess_options, providers=providers)
+        
+        # Check which provider is active
+        active_providers = self.session.get_providers()
+        if 'TensorrtExecutionProvider' in active_providers:
+            print(f"[ONNX] Running on TensorRT (INT8 enabled)")
+        elif 'CUDAExecutionProvider' in active_providers:
+            print(f"[ONNX] Running on CUDA (TensorRT unavailable)")
+        else:
+            raise RuntimeError(f"Failed to load on GPU. Active providers: {active_providers}")
+        
+        # Get input/output info
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
+        self.input_shape = self.session.get_inputs()[0].shape
+        
+        print(f"[ONNX] Input: {self.input_name}, Shape: {self.input_shape}")
+        print(f"[ONNX] Output: {self.output_name}")
+        
+        # Check for fixed input dimensions
+        self.has_fixed_input = all(isinstance(dim, int) for dim in self.input_shape)
+        if self.has_fixed_input:
+            self.fixed_h = self.input_shape[2]
+            self.fixed_w = self.input_shape[3]
+            print(f"[ONNX] Fixed input size: {self.fixed_h}x{self.fixed_w}")
+        else:
+            self.fixed_h = None
+            self.fixed_w = None
+    
+    def __call__(self, tensor):
+        """Run inference on GPU via ONNX Runtime."""
+        # Convert PyTorch tensor to numpy (ONNX Runtime handles GPU transfer)
+        input_np = tensor.cpu().numpy().astype(np.float32)
+        
+        # Run inference
+        outputs = self.session.run([self.output_name], {self.input_name: input_np})
+        
+        # Convert output back to PyTorch tensor on GPU
+        return torch.from_numpy(outputs[0]).to(device=self.device, dtype=self.dtype)
+    
+    def get_fixed_input_size(self):
+        """Return fixed input size if model has fixed dimensions."""
+        if self.has_fixed_input:
+            return (self.fixed_h, self.fixed_w)
+        return None
+    
+    def parameters(self):
+        """Compatibility method."""
+        return iter([torch.zeros(1)])
+    
+    def eval(self):
+        """Compatibility method."""
+        return self
+
+
 # Model Wrapper Class
 class DepthModelWrapper:
     def __init__(self, model_path, device, device_info, dtype, size=None,
                  onnx_path=ONNX_PATH, trt_path=TRT_PATH):
         """
-        Wrapper class that handles both PyTorch and TensorRT backends.
+        Wrapper class that handles PyTorch, ONNX, and TensorRT backends.
         """
         self.device = device
         self.device_info = device_info
@@ -458,10 +562,29 @@ class DepthModelWrapper:
         self.trt_path = trt_path
         self.size = size
         self.use_torch_compile = USE_TORCH_COMPILE
+        self.onnx_fixed_size = None  # Will store fixed input size for ONNX models
         
         # Determine backend based on device
         self.is_cuda = IS_CUDA
         
+        # Check if model_path is an ONNX file - use ONNX backend
+        if is_onnx_model(model_path):
+            if not ONNXRUNTIME_AVAILABLE:
+                raise ImportError("ONNX model detected but onnxruntime-gpu is not installed. Install it with: pip install onnxruntime-gpu")
+            if not self.is_cuda:
+                raise RuntimeError("ONNX models require CUDA/GPU. Please ensure a CUDA-capable device is available.")
+            
+            try:
+                self.backend = "ONNX"
+                self.model = ONNXModelWrapper(model_path, device_id=DEVICE_ID, dtype=dtype)
+                self.onnx_fixed_size = self.model.get_fixed_input_size()
+                print(f"Using backend: {self.backend}")
+                return
+            except Exception as e:
+                print(f"[Error] ONNX model loading failed: {str(e)}")
+                raise
+        
+        # Standard PyTorch/TensorRT path
         if self.is_cuda and USE_TENSORRT:
             # Use TensorRT backend for CUDA
             warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
@@ -535,6 +658,15 @@ class DepthModelWrapper:
     
     def __call__(self, tensor):
         """Run inference using the active backend."""
+        # ONNX backend - handles its own inference mode
+        if self.backend == "ONNX":
+            # ONNX Runtime handles GPU execution internally
+            # Ensure input is float32 for ONNX (most ONNX models expect float32)
+            if tensor.dtype != torch.float32:
+                tensor = tensor.to(dtype=torch.float32)
+            return self.model(tensor)
+        
+        # PyTorch and TensorRT backends
         if self.is_cuda:
             with torch.inference_mode():
                 with torch.amp.autocast('cuda'):
@@ -545,6 +677,7 @@ class DepthModelWrapper:
                             return self.model.predict_depth(tensor)
                         return self.model(pixel_values=tensor).predicted_depth
                     else:
+                        # TensorRT backend
                         return self.model(tensor)
         else:
             with torch.no_grad():
@@ -628,30 +761,40 @@ depth_stabilizer = DepthStabilizer(alpha=0.9)  # increase alpha for more stabili
 if USE_TORCH_COMPILE and IS_CUDA:
     depth_stabilizer.__call__ = torch.compile(depth_stabilizer.__call__, fullgraph=True)
 
-# Modified predict_depth function with improved TRT integration
+# Modified predict_depth function with improved TRT and ONNX integration
 def predict_depth(image_rgb: np.ndarray, return_tuple=False, use_temporal_smooth: bool = True):
     """
     Returns depth in [0,1], where 1 = near, 0 = far.
     Optionally returns (depth_tensor [H,W], rgb_c [C,H,W]) if return_tuple=True.
     
     Optimized: All resizing and normalization done on GPU for maximum performance.
+    Supports PyTorch, TensorRT, and ONNX backends.
     """
     h, w = image_rgb.shape[:2]
     
-    # Compute target size: scale shortest edge to DEPTH_RESOLUTION, preserve aspect ratio
-    scale = DEPTH_RESOLUTION / min(h, w)
-    target_h, target_w = int(round(h * scale)), int(round(w * scale))
+    # Check if using ONNX backend with fixed input size
+    is_onnx_backend = hasattr(model_wraper, 'backend') and model_wraper.backend == "ONNX"
+    onnx_fixed_size = getattr(model_wraper, 'onnx_fixed_size', None)
     
-    # Ensure dimensions divisible by 14 for ViT-based models (Depth Anything, etc.)
-    if "anything" in MODEL_ID.lower():
-        target_h = (target_h // 14) * 14
-        target_w = (target_w // 14) * 14
-        # Special case: Video-Depth-Anything expects fixed square input
-        if "video-depth-anything" in MODEL_ID.lower():
-            target_h, target_w = DEPTH_RESOLUTION, DEPTH_RESOLUTION
+    # Compute target size based on backend
+    if is_onnx_backend and onnx_fixed_size is not None:
+        # ONNX model with fixed input dimensions - use those
+        target_h, target_w = onnx_fixed_size
     else:
-        # Fixed square input for other models (e.g., DepthPro, DPT)
-        target_h, target_w = DEPTH_RESOLUTION, DEPTH_RESOLUTION
+        # Standard size computation
+        scale = DEPTH_RESOLUTION / min(h, w)
+        target_h, target_w = int(round(h * scale)), int(round(w * scale))
+        
+        # Ensure dimensions divisible by 14 for ViT-based models (Depth Anything, etc.)
+        if "anything" in MODEL_ID.lower():
+            target_h = (target_h // 14) * 14
+            target_w = (target_w // 14) * 14
+            # Special case: Video-Depth-Anything expects fixed square input
+            if "video-depth-anything" in MODEL_ID.lower():
+                target_h, target_w = DEPTH_RESOLUTION, DEPTH_RESOLUTION
+        else:
+            # Fixed square input for other models (e.g., DepthPro, DPT)
+            target_h, target_w = DEPTH_RESOLUTION, DEPTH_RESOLUTION
 
     # EARLY GPU TRANSFER + FULL GPU PREPROCESSING
     # Convert NumPy -> Torch tensor and move to device early
@@ -675,10 +818,19 @@ def predict_depth(image_rgb: np.ndarray, return_tuple=False, use_temporal_smooth
 
     # Normalize using ImageNet stats (or custom) — on GPU
     tensor = (tensor - MEAN) / STD
-    tensor = tensor.to(dtype=MODEL_DTYPE).contiguous()
+    
+    # For ONNX backend, keep float32; for others, use MODEL_DTYPE
+    if is_onnx_backend:
+        tensor = tensor.to(dtype=torch.float32).contiguous()
+    else:
+        tensor = tensor.to(dtype=MODEL_DTYPE).contiguous()
 
     # MODEL INFERENCE
-    if "video-depth-anything" in MODEL_ID.lower():
+    if is_onnx_backend:
+        # ONNX backend - direct call (handles its own context)
+        with torch.no_grad():
+            depth = model_wraper(tensor)
+    elif "video-depth-anything" in MODEL_ID.lower():
         with torch.no_grad():
             depth = model_wraper(tensor)
     else:

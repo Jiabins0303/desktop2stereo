@@ -1,6 +1,6 @@
-Capture Mode: Monitor
+Capture Mode: Window
 Monitor Index: 1
-Window Title: ''
+Window Title: Media Player
 FPS: 60
 Show FPS: true
 Output Resolution: 1080
@@ -390,14 +390,14 @@ Model List:
   apple/DepthPro-hf:
     resolutions:
     - 1536
-Depth Model: depth-anything/Depth-Anything-V2-Small-hf
+Depth Model: C:/Users/jiabi/Downloads/distill_any_depth_qat_qdq.onnx
 Depth Strength: 2.0
-Anti-aliasing: 2
+Anti-aliasing: 1
 Foreground Scale: 0.5
 Depth Resolution: 336
-FP16: true
+FP16: false
 Download Path: models
-HF Endpoint: https://hf-mirror.com
+HF Endpoint: https://huggingface.co
 Computing Device: 0
 Language: EN
 Run Mode: Local Viewer
@@ -407,13 +407,15 @@ Stream Quality: 100
 torch.compile: false
 TensorRT: false
 Recompile TensorRT: false
+Use ONNX: true
+ONNX Model Path: C:/Users/jiabi/Downloads/distill_any_depth_qat_qdq.onnx
 Unlock Thread (Legacy Streamer): false
 Capture Tool: DXCamera
 Fill 16:9: true
 Fix Viewer Aspect: false
 Lossless Scaling Support: false
 Stream Key: live
-Stereo Mix: 立体声混音 (Realtek(R) Audio)
+Stereo Mix: virtual-audio-capturer
 CRF: 20
 Audio Delay: -0.15
 Specify Display: false

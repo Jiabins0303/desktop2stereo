@@ -32,8 +32,15 @@ DISABLE_TRT_KEYWORDS = [
     "da3", 
     "dpt",
     "zoedepth",
-    "depthpro"
+    "depthpro",
+    ".onnx"  # ONNX models don't use TensorRT path
 ]
+
+def is_onnx_model(model_path: str) -> bool:
+    """Check if the model path points to an ONNX model file."""
+    if model_path is None:
+        return False
+    return str(model_path).lower().endswith('.onnx')
 
 # Global shutdown event
 shutdown_event = threading.Event()
@@ -212,6 +219,13 @@ STEREOMIX_DEVICE = settings["Stereo Mix"] # RTMP StereoMix Device
 STREAM_KEY = settings["Stream Key"]
 AUDIO_DELAY = settings["Audio Delay"]
 CRF = settings["CRF"]
+
+# ONNX Model Settings
+USE_ONNX = settings.get("Use ONNX", False)  # Use ONNX Runtime for inference
+ONNX_MODEL_PATH = settings.get("ONNX Model Path", "")  # Path to custom ONNX model file
+# If ONNX model path is set and valid, use it as MODEL_ID
+if USE_ONNX and ONNX_MODEL_PATH and is_onnx_model(ONNX_MODEL_PATH):
+    MODEL_ID = ONNX_MODEL_PATH
 
 # Determin the run mode and stream mode
 if RUN_MODE == "Local Viewer":
