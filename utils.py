@@ -33,7 +33,7 @@ DISABLE_TRT_KEYWORDS = [
     "dpt",
     "zoedepth",
     "depthpro",
-    ".onnx"  # ONNX models don't use TensorRT path
+    # Note: .onnx files now USE native TensorRT via _load_qdq_tensorrt_engine()
 ]
 
 def is_onnx_model(model_path: str) -> bool:
@@ -221,7 +221,8 @@ AUDIO_DELAY = settings["Audio Delay"]
 CRF = settings["CRF"]
 
 # ONNX Model Settings
-USE_ONNX = settings.get("Use ONNX", False)  # Use ONNX Runtime for inference
+# ONNX models (especially INT8 QDQ) are compiled to native TensorRT for inference
+USE_ONNX = settings.get("Use ONNX", False)  # Enable ONNX model path
 ONNX_MODEL_PATH = settings.get("ONNX Model Path", "")  # Path to custom ONNX model file
 # If ONNX model path is set and valid, use it as MODEL_ID
 if USE_ONNX and ONNX_MODEL_PATH and is_onnx_model(ONNX_MODEL_PATH):

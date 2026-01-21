@@ -283,10 +283,16 @@ def get_da3_model(model_id=MODEL_ID):
     return model.to(DEVICE)
 
 # TensorRT Optimization
-def optimize_with_tensorrt(onnx_path=ONNX_PATH, trt_path=TRT_PATH):
+def optimize_with_tensorrt(onnx_path=ONNX_PATH, trt_path=TRT_PATH, enable_int8=False):
     """
     Convert ONNX model to TensorRT engine using TensorRT's Python API only.
     Supports FP32, FP16, and INT8 precisions based on global flags.
+    
+    Args:
+        onnx_path: Path to the ONNX model file
+        trt_path: Path to save the TensorRT engine
+        enable_int8: Enable INT8 precision for QDQ models (no calibrator needed)
+    
     Returns None if compilation fails.
     """
     try:
@@ -314,6 +320,11 @@ def optimize_with_tensorrt(onnx_path=ONNX_PATH, trt_path=TRT_PATH):
         
         # Set precision flags based on global configuration
         config.set_flag(trt.BuilderFlag.FP16)
+        
+        # Enable INT8 for QDQ models - TensorRT reads quantization params from QDQ nodes
+        if enable_int8:
+            config.set_flag(trt.BuilderFlag.INT8)
+            print("[TensorRT] INT8 mode enabled for QDQ model")
         
         # Set workspace memory (essential for all precision modes) 
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 << 30)  # 4 GB Workspace 
@@ -413,6 +424,13 @@ class TensorRTEngine:
                 else:
                     self.output_binding_indices.append(binding)
             
+            # Store the actual output name (first output) for dynamic model support
+            if self.output_binding_indices:
+                first_output_binding = self.output_binding_indices[0]
+                self.output_name = self.engine.get_tensor_name(first_output_binding)
+            else:
+                raise RuntimeError("No output bindings found in TensorRT engine")
+            
             # Pre-allocate output tensors
             self.output_shapes = {}
             for binding in self.output_binding_indices:
@@ -448,15 +466,21 @@ class TensorRTEngine:
         # Execute inference
         self.context.execute_v2(bindings=bindings)
         
-        # Return the main output (predicted_depth)
-        return outputs['predicted_depth']
+        # Return the main output using detected name (supports different models)
+        return outputs[self.output_name]
 
 
 # ONNX Runtime Model Wrapper Class for GPU Inference
+# DEPRECATED: This class is no longer used. ONNX files are now compiled directly
+# to native TensorRT engines via _load_qdq_tensorrt_engine() for better INT8 support.
+# Kept for reference only.
 class ONNXModelWrapper:
     """
-    Wrapper for ONNX model inference using TensorRT Execution Provider.
-    Supports INT8 QDQ models with native INT8 kernel acceleration.
+    DEPRECATED: Use native TensorRT via _load_qdq_tensorrt_engine() instead.
+    
+    This class used ONNX Runtime with TensorRT Execution Provider, but encountered
+    issues with INT8 QDQ models (HasExternalDataInMemory error). Native TensorRT
+    compilation provides better compatibility.
     """
     def __init__(self, onnx_path, device_id=0, dtype=torch.float32):
         if not ONNXRUNTIME_AVAILABLE:
@@ -567,21 +591,21 @@ class DepthModelWrapper:
         # Determine backend based on device
         self.is_cuda = IS_CUDA
         
-        # Check if model_path is an ONNX file - use ONNX backend
+        # Check if model_path is an ONNX file - use native TensorRT with INT8 support
         if is_onnx_model(model_path):
-            if not ONNXRUNTIME_AVAILABLE:
-                raise ImportError("ONNX model detected but onnxruntime-gpu is not installed. Install it with: pip install onnxruntime-gpu")
             if not self.is_cuda:
                 raise RuntimeError("ONNX models require CUDA/GPU. Please ensure a CUDA-capable device is available.")
             
             try:
-                self.backend = "ONNX"
-                self.model = ONNXModelWrapper(model_path, device_id=DEVICE_ID, dtype=dtype)
-                self.onnx_fixed_size = self.model.get_fixed_input_size()
-                print(f"Using backend: {self.backend}")
+                # Use native TensorRT for QDQ ONNX models (better INT8 support than ONNX Runtime)
+                self.backend = "TensorRT"
+                self.model = self._load_qdq_tensorrt_engine(model_path)
+                if self.model is None:
+                    raise RuntimeError("Failed to compile QDQ ONNX to TensorRT engine")
+                print(f"Using backend: {self.backend} (QDQ INT8)")
                 return
             except Exception as e:
-                print(f"[Error] ONNX model loading failed: {str(e)}")
+                print(f"[Error] QDQ TensorRT loading failed: {str(e)}")
                 raise
         
         # Standard PyTorch/TensorRT path
@@ -656,17 +680,41 @@ class DepthModelWrapper:
             print(f"[Error] TensorRT engine loading failed: {str(e)}")
             return None
     
+    def _load_qdq_tensorrt_engine(self, qdq_onnx_path):
+        """
+        Load TensorRT engine directly from QDQ ONNX model.
+        Skips PyTorch model loading and ONNX export - goes straight to TensorRT compilation.
+        
+        Args:
+            qdq_onnx_path: Path to the QDQ ONNX model file
+        
+        Returns:
+            TensorRTEngine instance or None if compilation fails
+        """
+        # Generate TRT path based on ONNX filename
+        base_name = os.path.splitext(os.path.basename(qdq_onnx_path))[0]
+        onnx_dir = os.path.dirname(os.path.abspath(qdq_onnx_path))
+        trt_path = os.path.join(onnx_dir, f"{base_name}_int8.trt")
+        
+        print(f"[TensorRT] Compiling QDQ ONNX to INT8 TensorRT engine...")
+        print(f"[TensorRT] Source: {qdq_onnx_path}")
+        print(f"[TensorRT] Target: {trt_path}")
+        
+        # Compile with INT8 enabled for QDQ models
+        engine_path = optimize_with_tensorrt(qdq_onnx_path, trt_path, enable_int8=True)
+        if engine_path is None:
+            print("[Error] Failed to compile QDQ ONNX to TensorRT")
+            return None
+        
+        try:
+            return TensorRTEngine(engine_path, self.device, self.dtype)
+        except Exception as e:
+            print(f"[Error] TensorRT engine loading failed: {str(e)}")
+            return None
+    
     def __call__(self, tensor):
         """Run inference using the active backend."""
-        # ONNX backend - handles its own inference mode
-        if self.backend == "ONNX":
-            # ONNX Runtime handles GPU execution internally
-            # Ensure input is float32 for ONNX (most ONNX models expect float32)
-            if tensor.dtype != torch.float32:
-                tensor = tensor.to(dtype=torch.float32)
-            return self.model(tensor)
-        
-        # PyTorch and TensorRT backends
+        # PyTorch and TensorRT backends (ONNX files are now compiled to TensorRT)
         if self.is_cuda:
             with torch.inference_mode():
                 with torch.amp.autocast('cuda'):
