@@ -791,28 +791,35 @@ class ConfigGUI(tk.Tk):
 
     def update_tensorrt_visibility_based_on_model(self, model_name):
         if not IS_ROCM and "CUDA" in self.device_var.get():
-            """Disable TensorRT option for specific model types"""
+            """Update TensorRT option based on model type"""
             model_lower = model_name.lower()
             
-            # Check if any keyword is in the model name (including .onnx)
+            # Check if any keyword is in the model name (excluding .onnx which now uses TensorRT)
             should_disable = any(keyword in model_lower for keyword in DISABLE_TRT_KEYWORDS)
             
-            # Also disable for ONNX models
+            # ONNX models now USE TensorRT (native compilation) - enable and auto-select it
             if is_onnx_model(model_name):
-                should_disable = True
-            
-            # Update TensorRT checkbox state
-            if should_disable:
-                # Disable and uncheck TensorRT
+                # Enable TensorRT and auto-select it for ONNX models
+                self.use_tensorrt.set(True)
+                self.check_tensorrt.config(state="normal")
+                self.check_recompile_trt.config(state="normal")
+                self.update_recompile_trt_visibility()
+                # Disable torch.compile for ONNX (not using PyTorch)
+                self.use_torch_compile.set(False)
+                self.check_torch_compile.config(state="disabled")
+            elif should_disable:
+                # Disable TensorRT for other incompatible models
                 self.use_tensorrt.set(False)
                 self.check_tensorrt.config(state="disabled")
                 self.check_recompile_trt.config(state="disabled")
                 # Also hide recompile option
                 self.check_recompile_trt.grid_remove()
             else:
-                # Enable TensorRT if device supports it
+                # Enable TensorRT for compatible models
                 self.check_tensorrt.config(state="normal")
                 self.check_recompile_trt.config(state="normal")
+                # Re-enable torch.compile if it was disabled
+                self.check_torch_compile.config(state="normal")
                 # Update recompile visibility based on current TensorRT selection
                 self.update_recompile_trt_visibility()
     
@@ -825,11 +832,13 @@ class ConfigGUI(tk.Tk):
             filetypes=filetypes
         )
         if filepath:
-            # Set the ONNX model path
+            # Set the ONNX model path and also set it as the depth model
             self.onnx_model_path_var.set(filepath)
             self.use_onnx_var.set(True)
+            # Set the ONNX path as the selected depth model (so it uses native TensorRT)
+            self.depth_model_var.set(filepath)
             # Update status
-            self.update_status(f"{texts.get('ONNX Model Selected', 'ONNX Model Selected')}: {os.path.basename(filepath)}")
+            self.update_status(f"{texts.get('ONNX Model Selected', 'ONNX Model Selected')}: {os.path.basename(filepath)} (TensorRT will be used)")
     
     def clear_onnx_model(self):
         """Clear the ONNX model selection"""
@@ -851,23 +860,24 @@ class ConfigGUI(tk.Tk):
             self.onnx_model_entry.grid()
             self.btn_clear_onnx.grid()
             
-            # Disable TensorRT and torch.compile for ONNX models
-            self.use_tensorrt.set(False)
+            # ONNX models now use native TensorRT compilation - enable and auto-select TensorRT
+            if not IS_ROCM and "CUDA" in self.device_var.get():
+                self.use_tensorrt.set(True)  # Auto-enable TensorRT for ONNX models
+                self.check_tensorrt.config(state="normal")
+                self.check_recompile_trt.config(state="normal")
+                self.update_recompile_trt_visibility()
+            # Disable torch.compile for ONNX (we're not using PyTorch model)
             self.use_torch_compile.set(False)
-            self.check_tensorrt.config(state="disabled")
             self.check_torch_compile.config(state="disabled")
-            self.check_recompile_trt.grid_remove()
         else:
             # Hide ONNX path display
             self.label_onnx_model.grid_remove()
             self.onnx_model_entry.grid_remove()
             self.btn_clear_onnx.grid_remove()
             
-            # Re-enable TensorRT and torch.compile
+            # Re-enable TensorRT and torch.compile based on model
             if "CUDA" in self.device_var.get():
-                self.check_tensorrt.config(state="normal")
-                self.check_torch_compile.config(state="normal")
-                # Update TensorRT visibility based on model
+                # Update TensorRT visibility based on model (will handle ONNX if model is ONNX path)
                 self.update_tensorrt_visibility_based_on_model(self.depth_model_var.get())
     
     # Support for lossless scaling
