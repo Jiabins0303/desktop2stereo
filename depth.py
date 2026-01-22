@@ -293,12 +293,16 @@ def optimize_with_tensorrt(onnx_path=ONNX_PATH, trt_path=TRT_PATH, enable_int8=F
         trt_path: Path to save the TensorRT engine
         enable_int8: Enable INT8 precision for QDQ models (no calibrator needed)
     
-    Returns None if compilation fails.
+    Returns:
+        tuple: (trt_path, fixed_input_shape) where fixed_input_shape is a tuple (N,C,H,W)
+               for fixed-dimension models, or None for dynamic models.
+        Returns None if compilation fails.
     """
     try:
         if os.path.exists(trt_path) and RECOMPILE_TRT == False:
             print(f"Loaded existing TensorRT engine: {trt_path}")
-            return trt_path
+            # For cached engines, return None for shape - caller should get it from TensorRTEngine
+            return trt_path, None
         
         import tensorrt as trt
         
@@ -329,16 +333,76 @@ def optimize_with_tensorrt(onnx_path=ONNX_PATH, trt_path=TRT_PATH, enable_int8=F
         # Set workspace memory (essential for all precision modes) 
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 << 30)  # 4 GB Workspace 
         
-        # Set dynamic shapes profile 
-        profile = builder.create_optimization_profile()
-        input_name = network.get_input(0).name
-        # Updated shape ranges to better match typical input sizes
-        min_shape = (1, 3, 224, 224)  # 224 = 14 * 16
-        opt_shape = (1, 3, (DEPTH_RESOLUTION//14)*14, (DEPTH_RESOLUTION//14)*14)
-        max_shape = (1, 3, 3920, 3920)  # 896 = 14 * 64
+        # Get input tensor info to detect fixed vs dynamic dimensions
+        input_tensor = network.get_input(0)
+        input_name = input_tensor.name
+        input_shape_raw = input_tensor.shape  # TensorRT Dims object
         
-        profile.set_shape(input_name, min_shape, opt_shape, max_shape)
-        config.add_optimization_profile(profile)
+        # Convert to list to properly handle TensorRT Dims object
+        input_shape = []
+        for i in range(len(input_shape_raw)):
+            dim_value = input_shape_raw[i]
+            input_shape.append(dim_value)
+        
+        # Debug: print the actual shape values
+        print(f"[TensorRT Debug] Input name: {input_name}")
+        print(f"[TensorRT Debug] Input shape: {input_shape}")
+        
+        # Check if input has any dynamic dimensions (-1)
+        has_dynamic_dims = any(dim == -1 for dim in input_shape)
+        
+        if has_dynamic_dims:
+            # Semi-dynamic or fully dynamic input: create optimization profile
+            # For dynamic dims (-1), use range; for fixed dims, use same value in min/opt/max
+            profile = builder.create_optimization_profile()
+            
+            # Build shapes respecting fixed vs dynamic dimensions
+            min_shape = []
+            opt_shape = []
+            max_shape = []
+            
+            for i, dim in enumerate(input_shape):
+                if dim == -1:
+                    # Dynamic dimension - use ranges
+                    if i == 0:
+                        # Batch dimension
+                        min_shape.append(1)
+                        opt_shape.append(1)
+                        max_shape.append(4)  # Reasonable max batch size
+                    elif i >= 2:
+                        # Spatial dimensions - if user has dynamic spatial dims
+                        min_shape.append(224)
+                        opt_shape.append((DEPTH_RESOLUTION//14)*14)
+                        max_shape.append(3920)
+                    else:
+                        # Channel dimension (rare to be dynamic)
+                        min_shape.append(3)
+                        opt_shape.append(3)
+                        max_shape.append(3)
+                else:
+                    # Fixed dimension - must use same value in min/opt/max
+                    min_shape.append(dim)
+                    opt_shape.append(dim)
+                    max_shape.append(dim)
+            
+            min_shape = tuple(min_shape)
+            opt_shape = tuple(opt_shape)
+            max_shape = tuple(max_shape)
+            
+            profile.set_shape(input_name, min_shape, opt_shape, max_shape)
+            config.add_optimization_profile(profile)
+            print(f"[TensorRT] Dynamic dims detected, profile: min={min_shape}, opt={opt_shape}, max={max_shape}")
+            
+            # For models with fixed spatial dims, store them
+            if len(input_shape) >= 4 and input_shape[2] > 0 and input_shape[3] > 0:
+                fixed_input_shape = tuple([1 if d == -1 else d for d in input_shape])
+                print(f"[TensorRT] Fixed spatial dimensions: {input_shape[2]}x{input_shape[3]}")
+            else:
+                fixed_input_shape = None
+        else:
+            # Fully fixed input: no optimization profile needed
+            print(f"[TensorRT] Fully fixed input shape: {input_shape}")
+            fixed_input_shape = tuple(input_shape)
         
         # Optional: Enable additional optimizations that work well with FP32 [5](@ref)
         # These optimizations can improve performance regardless of precision
@@ -355,7 +419,7 @@ def optimize_with_tensorrt(onnx_path=ONNX_PATH, trt_path=TRT_PATH, enable_int8=F
             f.write(serialized_engine)
         
         print(f"[Main] TensorRT engine saved to {trt_path}")
-        return trt_path
+        return trt_path, fixed_input_shape
         
     except Exception as e:
         print(f"[Error] TensorRT optimization failed: {str(e)}")
@@ -398,6 +462,7 @@ class TensorRTEngine:
         """
         self.device = device
         self.dtype = dtype
+        self.input_shape = None  # Store input shape for fixed-dimension models
         
         try:
             import tensorrt as trt
@@ -411,18 +476,31 @@ class TensorRTEngine:
             self.engine = runtime.deserialize_cuda_engine(engine_data)
             self.context = self.engine.create_execution_context()
             
-            # Get binding information using names instead of deprecated methods
+            # Get binding information using TensorRT's tensor mode API
             self.input_binding_indices = []
             self.output_binding_indices = []
             
             for binding in range(self.engine.num_io_tensors):
                 name = self.engine.get_tensor_name(binding)
+                mode = self.engine.get_tensor_mode(name)
                 
-                # Use name pattern matching to identify inputs/outputs
-                if "input" in name.lower() or "pixel_values" in name.lower():
+                if mode == trt.TensorIOMode.INPUT:
                     self.input_binding_indices.append(binding)
                 else:
                     self.output_binding_indices.append(binding)
+            
+            # Store input name and shape (for fixed-dimension detection)
+            if self.input_binding_indices:
+                first_input_binding = self.input_binding_indices[0]
+                self.input_name = self.engine.get_tensor_name(first_input_binding)
+                # Get the input shape from the engine
+                engine_input_shape = tuple(self.engine.get_tensor_shape(self.input_name))
+                # Check if all dimensions are positive (fixed) or have -1 (dynamic)
+                if all(dim > 0 for dim in engine_input_shape):
+                    self.input_shape = engine_input_shape
+                    print(f"[TensorRT] Engine has fixed input shape: {self.input_shape}")
+            else:
+                raise RuntimeError("No input bindings found in TensorRT engine")
             
             # Store the actual output name (first output) for dynamic model support
             if self.output_binding_indices:
@@ -439,6 +517,15 @@ class TensorRTEngine:
             
         except ImportError:
             raise ImportError("TensorRT not available")
+    
+    def get_fixed_input_size(self):
+        """
+        Return the fixed input size (H, W) if the engine has fixed dimensions.
+        Returns None if the engine has dynamic dimensions.
+        """
+        if self.input_shape is not None and len(self.input_shape) == 4:
+            return (self.input_shape[2], self.input_shape[3])  # (H, W)
+        return None
 
     def __call__(self, tensor):
         """Execute inference with TensorRT using native API."""
@@ -587,6 +674,7 @@ class DepthModelWrapper:
         self.size = size
         self.use_torch_compile = USE_TORCH_COMPILE
         self.onnx_fixed_size = None  # Will store fixed input size for ONNX models
+        self.trt_fixed_size = None   # Will store fixed input size for QDQ TensorRT models
         
         # Determine backend based on device
         self.is_cuda = IS_CUDA
@@ -671,11 +759,19 @@ class DepthModelWrapper:
             export_to_onnx(pytorch_model, self.onnx_path, self.device, self.dtype)
         
         # Build or load TensorRT engine
-        trt_engine_path = optimize_with_tensorrt(self.onnx_path, self.trt_path)
-        if trt_engine_path is None:
+        result = optimize_with_tensorrt(self.onnx_path, self.trt_path)
+        if result is None:
             return None
+        
+        trt_engine_path, fixed_shape = result
+        
         try:
-            return TensorRTEngine(trt_engine_path, self.device, self.dtype)
+            engine = TensorRTEngine(trt_engine_path, self.device, self.dtype)
+            # Get fixed input size from engine (handles both cached and newly compiled)
+            fixed_size = engine.get_fixed_input_size()
+            if fixed_size is not None:
+                self.trt_fixed_size = fixed_size
+            return engine
         except Exception as e:
             print(f"[Error] TensorRT engine loading failed: {str(e)}")
             return None
@@ -701,13 +797,21 @@ class DepthModelWrapper:
         print(f"[TensorRT] Target: {trt_path}")
         
         # Compile with INT8 enabled for QDQ models
-        engine_path = optimize_with_tensorrt(qdq_onnx_path, trt_path, enable_int8=True)
-        if engine_path is None:
+        result = optimize_with_tensorrt(qdq_onnx_path, trt_path, enable_int8=True)
+        if result is None:
             print("[Error] Failed to compile QDQ ONNX to TensorRT")
             return None
         
+        engine_path, fixed_shape = result
+        
         try:
-            return TensorRTEngine(engine_path, self.device, self.dtype)
+            engine = TensorRTEngine(engine_path, self.device, self.dtype)
+            # Get fixed input size from engine (handles both cached and newly compiled)
+            fixed_size = engine.get_fixed_input_size()
+            if fixed_size is not None:
+                self.trt_fixed_size = fixed_size
+                print(f"[TensorRT] Model requires fixed input: {self.trt_fixed_size}")
+            return engine
         except Exception as e:
             print(f"[Error] TensorRT engine loading failed: {str(e)}")
             return None
@@ -820,14 +924,18 @@ def predict_depth(image_rgb: np.ndarray, return_tuple=False, use_temporal_smooth
     """
     h, w = image_rgb.shape[:2]
     
-    # Check if using ONNX backend with fixed input size
+    # Check if using fixed input size (ONNX or TensorRT with QDQ model)
     is_onnx_backend = hasattr(model_wraper, 'backend') and model_wraper.backend == "ONNX"
     onnx_fixed_size = getattr(model_wraper, 'onnx_fixed_size', None)
+    trt_fixed_size = getattr(model_wraper, 'trt_fixed_size', None)
     
     # Compute target size based on backend
     if is_onnx_backend and onnx_fixed_size is not None:
         # ONNX model with fixed input dimensions - use those
         target_h, target_w = onnx_fixed_size
+    elif trt_fixed_size is not None:
+        # QDQ TensorRT model with fixed input dimensions
+        target_h, target_w = trt_fixed_size
     else:
         # Standard size computation
         scale = DEPTH_RESOLUTION / min(h, w)
