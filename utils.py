@@ -202,6 +202,7 @@ SHOW_FPS, FPS, DEPTH_STRENGTH = settings["Show FPS"], settings["FPS"], settings[
 IPD = settings["IPD"]
 CAPTURE_MODE = settings["Capture Mode"]
 WINDOW_TITLE = settings["Window Title"]
+VIDEO_PATH = settings.get("Video Path", "")
 
 # Image Processing Parameters
 FOREGROUND_SCALE = settings["Foreground Scale"] / 10 # 0-10
@@ -243,6 +244,9 @@ elif RUN_MODE == "RTMP Streamer":
     if OS_NAME == "Windows":
         # Frame Generation Settings for RTMP, Local Viewer not requried
         LOSSLESS_SCALING_SUPPORT = settings["Lossless Scaling Support"]
+elif RUN_MODE == "Upload Video":
+    RUN_MODE = "Viewer"
+    CAPTURE_MODE = "Video"
 else:
     RUN_MODE = "Streamer"
 

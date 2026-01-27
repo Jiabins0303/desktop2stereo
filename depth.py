@@ -687,6 +687,7 @@ class DepthModelWrapper:
             try:
                 # Use native TensorRT for QDQ ONNX models (better INT8 support than ONNX Runtime)
                 self.backend = "TensorRT"
+                self.is_qdq_model = True  # Flag to indicate this is a QDQ ONNX model compiled to TensorRT
                 self.model = self._load_qdq_tensorrt_engine(model_path)
                 if self.model is None:
                     raise RuntimeError("Failed to compile QDQ ONNX to TensorRT engine")
@@ -925,13 +926,13 @@ def predict_depth(image_rgb: np.ndarray, return_tuple=False, use_temporal_smooth
     h, w = image_rgb.shape[:2]
     
     # Check if using fixed input size (ONNX or TensorRT with QDQ model)
-    is_onnx_backend = hasattr(model_wraper, 'backend') and model_wraper.backend == "ONNX"
+    is_qdq_model = getattr(model_wraper, 'is_qdq_model', False)
     onnx_fixed_size = getattr(model_wraper, 'onnx_fixed_size', None)
     trt_fixed_size = getattr(model_wraper, 'trt_fixed_size', None)
     
     # Compute target size based on backend
-    if is_onnx_backend and onnx_fixed_size is not None:
-        # ONNX model with fixed input dimensions - use those
+    if is_qdq_model and onnx_fixed_size is not None:
+        # QDQ ONNX model with fixed input dimensions - use those
         target_h, target_w = onnx_fixed_size
     elif trt_fixed_size is not None:
         # QDQ TensorRT model with fixed input dimensions
@@ -975,16 +976,16 @@ def predict_depth(image_rgb: np.ndarray, return_tuple=False, use_temporal_smooth
     # Normalize using ImageNet stats (or custom) — on GPU
     tensor = (tensor - MEAN) / STD
     
-    # For ONNX backend, keep float32; for others, use MODEL_DTYPE
-    if is_onnx_backend:
+    # For QDQ TensorRT models (from ONNX), keep float32; for others, use MODEL_DTYPE
+    if is_qdq_model:
         tensor = tensor.to(dtype=torch.float32).contiguous()
     else:
         tensor = tensor.to(dtype=MODEL_DTYPE).contiguous()
 
     # MODEL INFERENCE
-    if is_onnx_backend:
-        # ONNX backend - direct call (handles its own context)
-        with torch.no_grad():
+    if is_qdq_model:
+        # QDQ TensorRT model - direct call with inference mode
+        with torch.inference_mode():
             depth = model_wraper(tensor)
     elif "video-depth-anything" in MODEL_ID.lower():
         with torch.no_grad():
@@ -1139,7 +1140,7 @@ def make_sbs_core(rgb: torch.Tensor,
         grid_left = torch.stack([xs + shift_norm, ys], dim=-1)
         grid_right = torch.stack([xs - shift_norm, ys], dim=-1)
         if IS_MPS:
-            grid_left, grid_right = grid_right.clamp(-1,1), grid_right.clamp(-1,1)
+            grid_left, grid_right = grid_left.clamp(-1,1), grid_right.clamp(-1,1)
             left = F.grid_sample(img, grid_left, mode="bilinear",
                                 padding_mode="zeros", align_corners=False)[0]
             right = F.grid_sample(img, grid_right, mode="bilinear",
