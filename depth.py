@@ -1101,24 +1101,39 @@ def overlay_fps(rgb: torch.Tensor, fps: float):
     return rgb * (1 - alpha) + color * alpha
 
 
-# generate left and right eye view for streamer 
-def make_sbs_core(rgb: torch.Tensor,
-                  depth: torch.Tensor,
-                  ipd_uv=0.064,
-                  depth_ratio=1.0,
-                  display_mode="Half-SBS",
-                  fill_16_9=FILL_16_9,
-                  device=DEVICE) -> torch.Tensor:
-    """
-    Core tensor operations for side-by-side stereo.
-    Keeps CUDA fast path (grid_sample) and fallback path (gather).
-    Compatible with torch.compile.
-    Inputs:
-        rgb: [C,H,W] float tensor
-        depth: [H,W] float tensor
-    Returns:
-        SBS image [C,H,W] float tensor (0-255 range)
-    """
+def _coerce_rgb_tensor(rgb_c, depth: torch.Tensor) -> torch.Tensor:
+    """Convert input RGB to CHW tensor on the same device/dtype as depth."""
+    if isinstance(rgb_c, np.ndarray):
+        rgb = torch.from_numpy(rgb_c).to(device=depth.device, dtype=depth.dtype)
+        if rgb.ndim == 3 and rgb.shape[2] == 3:
+            rgb = rgb.permute(2, 0, 1)
+    else:
+        rgb = rgb_c.to(device=depth.device, dtype=depth.dtype)
+    return rgb
+
+
+def _pad_to_aspect_tensor(tensor, target_ratio=(16, 9)):
+    _, h, w = tensor.shape
+    t_w, t_h = target_ratio
+    r_img, r_t = w / h, t_w / t_h
+    if abs(r_img - r_t) < 1e-3:
+        return tensor
+    if r_img > r_t:  # too wide -> pad height
+        new_h = int(round(w / r_t))
+        pad_top = (new_h - h) // 2
+        return F.pad(tensor, (0, 0, pad_top, new_h - h - pad_top))
+    new_w = int(round(h * r_t))
+    pad_left = (new_w - w) // 2
+    return F.pad(tensor, (pad_left, new_w - w - pad_left, 0, 0))
+
+
+def _generate_stereo_pair_core(rgb: torch.Tensor,
+                               depth: torch.Tensor,
+                               ipd_uv=0.064,
+                               depth_ratio=1.0,
+                               fill_16_9=FILL_16_9,
+                               device=DEVICE):
+    """Return left/right eye tensors in 0-255 range."""
     # Cast to float32 for DirectML compatibility (avoids float64 ops)
     if IS_DIRECTML:
         rgb = rgb.to(dtype=torch.float32, device=device)
@@ -1163,27 +1178,14 @@ def make_sbs_core(rgb: torch.Tensor,
         # Right eye
         gather_idx_right = coords_right.unsqueeze(0).expand(C, H, W).unsqueeze(0)
         right = torch.gather(img.expand(1, C, H, W), 3, gather_idx_right)[0]
-    
-    # Aspect pad helper
-    def pad_to_aspect_tensor(tensor, target_ratio=(16, 9)):
-        _, h, w = tensor.shape
-        t_w, t_h = target_ratio
-        r_img, r_t = w / h, t_w / t_h
-        if abs(r_img - r_t) < 1e-3:
-            return tensor
-        if r_img > r_t:  # too wide -> pad height
-            new_h = int(round(w / r_t))
-            pad_top = (new_h - h) // 2
-            return F.pad(tensor, (0, 0, pad_top, new_h - h - pad_top))
-        else:  # too tall -> pad width
-            new_w = int(round(h * r_t))
-            pad_left = (new_w - w) // 2
-            return F.pad(tensor, (pad_left, new_w - w - pad_left, 0, 0))
-    
-    # Aspect pad & arrange SBS/TAB
+
     if fill_16_9:
-        left = pad_to_aspect_tensor(left)
-        right = pad_to_aspect_tensor(right)
+        left = _pad_to_aspect_tensor(left)
+        right = _pad_to_aspect_tensor(right)
+    return left.clamp(0, 255), right.clamp(0, 255)
+
+
+def _arrange_stereo_output(left: torch.Tensor, right: torch.Tensor, display_mode="Half-SBS") -> torch.Tensor:
     if display_mode == "TAB":
         out = torch.cat([left, right], dim=1)
     else:
@@ -1192,6 +1194,39 @@ def make_sbs_core(rgb: torch.Tensor,
         out = F.interpolate(out.unsqueeze(0), size=left.shape[1:], mode="area")[0]
     return out.clamp(0, 255)
 
+
+def _tensor_to_uint8_hwc(tensor: torch.Tensor) -> np.ndarray:
+    return tensor.to(torch.uint8).permute(1, 2, 0).contiguous().cpu().numpy()
+
+
+def depth_to_image(depth) -> np.ndarray:
+    """Convert normalized depth to an 8-bit grayscale image."""
+    if hasattr(depth, "detach"):
+        return depth.detach().clamp(0, 1).mul(255).round().to(torch.uint8).cpu().numpy()
+    depth_arr = np.asarray(depth, dtype=np.float32)
+    return np.clip(np.rint(depth_arr * 255.0), 0, 255).astype(np.uint8)
+
+
+def make_sbs_core(rgb: torch.Tensor,
+                  depth: torch.Tensor,
+                  ipd_uv=0.064,
+                  depth_ratio=1.0,
+                  display_mode="Half-SBS",
+                  fill_16_9=FILL_16_9,
+                  device=DEVICE) -> torch.Tensor:
+    """
+    Core tensor operations for side-by-side stereo.
+    Keeps CUDA fast path (grid_sample) and fallback path (gather).
+    Compatible with torch.compile.
+    Inputs:
+        rgb: [C,H,W] float tensor
+        depth: [H,W] float tensor
+    Returns:
+        SBS image [C,H,W] float tensor (0-255 range)
+    """
+    left, right = _generate_stereo_pair_core(rgb, depth, ipd_uv, depth_ratio, fill_16_9, device)
+    return _arrange_stereo_output(left, right, display_mode)
+
 def make_sbs(rgb_c, depth, ipd_uv=0.064, depth_ratio=1.0, display_mode="Half-SBS", fps=None):
     """
     Full function: adds optional FPS overlay and converts output to numpy uint8.
@@ -1199,24 +1234,65 @@ def make_sbs(rgb_c, depth, ipd_uv=0.064, depth_ratio=1.0, display_mode="Half-SBS
     """
     if depth.dim() == 3 and depth.shape[0] == 1:
         depth = depth[0]
-        
-    # Handle input type conversion
-    if isinstance(rgb_c, np.ndarray):
-        # Convert numpy array to tensor with matching device/dtype
-        rgb = torch.from_numpy(rgb_c).to(device=depth.device, dtype=depth.dtype)
-        # Convert from HWC to CHW format
-        if rgb.ndim == 3 and rgb.shape[2] == 3:
-            rgb = rgb.permute(2, 0, 1)
-    else:
-        # Ensure tensor is on correct device and dtype
-        rgb = rgb_c.to(device=depth.device, dtype=depth.dtype)
+    rgb = _coerce_rgb_tensor(rgb_c, depth)
 
     # Optional FPS overlay can stay in Python side (avoids torch.compile recompiles)
     if fps is not None:
         rgb = overlay_fps(rgb, fps)  # your existing overlay function
 
     sbs_tensor = make_sbs_core(rgb, depth, ipd_uv, depth_ratio, display_mode)
-    return sbs_tensor.to(torch.uint8).permute(1,2,0).contiguous().cpu().numpy()
+    return _tensor_to_uint8_hwc(sbs_tensor)
+
+
+def make_stereo_views(rgb_c, depth, ipd_uv=0.064, depth_ratio=1.0, display_mode="Half-SBS", fps=None):
+    """Return left, right, and SBS images as uint8 numpy arrays."""
+    if depth.dim() == 3 and depth.shape[0] == 1:
+        depth = depth[0]
+    rgb = _coerce_rgb_tensor(rgb_c, depth)
+    if fps is not None:
+        rgb = overlay_fps(rgb, fps)
+    left, right = _generate_stereo_pair_core(rgb, depth, ipd_uv, depth_ratio)
+    sbs = _arrange_stereo_output(left, right, display_mode)
+    return _tensor_to_uint8_hwc(left), _tensor_to_uint8_hwc(right), _tensor_to_uint8_hwc(sbs)
+
+
+def _save_image_array(path: str, image: np.ndarray):
+    image = np.ascontiguousarray(image)
+    if image.ndim == 2:
+        ok = cv2.imwrite(path, image)
+    else:
+        ok = cv2.imwrite(path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+    if not ok:
+        raise OSError(f"Failed to save image: {path}")
+
+
+def save_image_outputs(input_path: str,
+                       depth,
+                       rgb_c,
+                       ipd_uv=0.064,
+                       depth_ratio=1.0,
+                       display_mode="Half-SBS") -> dict:
+    """Save depth, left, right, and SBS images next to the input image."""
+    base_path, _ = os.path.splitext(input_path)
+    depth_img = depth_to_image(depth)
+    left_img, right_img, sbs_img = make_stereo_views(
+        rgb_c,
+        depth,
+        ipd_uv=ipd_uv,
+        depth_ratio=depth_ratio,
+        display_mode=display_mode,
+    )
+    output_paths = {
+        "depth": f"{base_path}_depth.png",
+        "left": f"{base_path}_left.png",
+        "right": f"{base_path}_right.png",
+        "sbs": f"{base_path}_sbs.png",
+    }
+    _save_image_array(output_paths["depth"], depth_img)
+    _save_image_array(output_paths["left"], left_img)
+    _save_image_array(output_paths["right"], right_img)
+    _save_image_array(output_paths["sbs"], sbs_img)
+    return output_paths
 
 if USE_TORCH_COMPILE and IS_CUDA:
     make_sbs_core = torch.compile(make_sbs_core)

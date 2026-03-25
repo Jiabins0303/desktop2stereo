@@ -177,6 +177,7 @@ DEFAULTS = {
     "Specify Display": False,
     "Stereo Monitor": 1,
     "Video Path": "",
+    "Image Path": "",
 }
 
 UI_TEXTS = {
@@ -268,6 +269,11 @@ UI_TEXTS = {
         "Browse Video...": "Browse Video...",
         "Select Video File": "Select Video File",
         "Please select a video file": "Please select a video file before running",
+        "Single Image": "Single Image",
+        "Image Path:": "Image Path:",
+        "Browse Image...": "Browse Image...",
+        "Select Image File": "Select Image File",
+        "Please select an image file": "Please select an image file before running",
     },
     "CN": {
         "Monitor": "显示器",
@@ -357,6 +363,11 @@ UI_TEXTS = {
         "Browse Video...": "浏览视频...",
         "Select Video File": "选择视频文件",
         "Please select a video file": "请选择一个视频文件再运行",
+        "Single Image": "单张图片",
+        "Image Path:": "图片路径:",
+        "Browse Image...": "浏览图片...",
+        "Select Image File": "选择图片文件",
+        "Please select an image file": "请选择一张图片再运行",
     }
 }
 
@@ -677,6 +688,21 @@ class ConfigGUI(tk.Tk):
         self.btn_browse_video.grid(row=2, column=3, sticky="ew", **self.pad)
         self.btn_browse_video.grid_remove()  # Initially hidden
 
+        # Image Path controls (for Single Image mode) - Initially hidden
+        self.image_path_var = tk.StringVar()
+
+        self.label_image_path = ttk.Label(self.content_frame, text="Image Path:")
+        self.label_image_path.grid(row=3, column=0, sticky="w", **self.pad)
+        self.label_image_path.grid_remove()
+
+        self.image_path_entry = ttk.Entry(self.content_frame, textvariable=self.image_path_var, state="readonly")
+        self.image_path_entry.grid(row=3, column=1, columnspan=2, sticky="ew", **self.pad)
+        self.image_path_entry.grid_remove()
+
+        self.btn_browse_image = ttk.Button(self.content_frame, text="Browse Image...", command=self.browse_image_file)
+        self.btn_browse_image.grid(row=3, column=3, sticky="ew", **self.pad)
+        self.btn_browse_image.grid_remove()
+
         # Add Inference Optimizer dropdown after Device selection (moved to row 15)
         self.use_torch_compile = tk.BooleanVar()
         self.use_tensorrt = tk.BooleanVar()
@@ -888,6 +914,23 @@ class ConfigGUI(tk.Tk):
         if filepath:
             self.video_path_var.set(filepath)
             self.update_status(f"Video selected: {os.path.basename(filepath)}")
+
+    def browse_image_file(self):
+        """Open file dialog to select image file for Single Image mode"""
+        texts = UI_TEXTS[self.language]
+        filetypes = [
+            ("Image Files", "*.png;*.jpg;*.jpeg"),
+            ("PNG Image", "*.png"),
+            ("JPEG Image", "*.jpg;*.jpeg"),
+            ("All files", "*.*"),
+        ]
+        filepath = filedialog.askopenfilename(
+            title=texts.get("Select Image File", "Select Image File"),
+            filetypes=filetypes
+        )
+        if filepath:
+            self.image_path_var.set(filepath)
+            self.update_status(f"Image selected: {os.path.basename(filepath)}")
     
     def show_video_upload_controls(self):
         """Show controls for Upload Video mode"""
@@ -910,6 +953,26 @@ class ConfigGUI(tk.Tk):
         self.label_video_path.grid_remove()
         self.video_path_entry.grid_remove()
         self.btn_browse_video.grid_remove()
+
+    def show_image_upload_controls(self):
+        """Show controls for Single Image mode"""
+        self.label_image_path.grid()
+        self.image_path_entry.grid()
+        self.btn_browse_image.grid()
+
+        self.capture_mode_cb.grid_remove()
+        self.monitor_menu.grid_remove()
+        self.btn_refresh.grid_remove()
+        self.window_cb.grid_remove()
+
+        self.hide_all_streamer_controls()
+        self.fixed_viwer_aspect_cb.grid_remove()
+
+    def hide_image_upload_controls(self):
+        """Hide controls for Single Image mode"""
+        self.label_image_path.grid_remove()
+        self.image_path_entry.grid_remove()
+        self.btn_browse_image.grid_remove()
     
     def on_onnx_model_change(self, *args):
         """Handle changes to ONNX model path"""
@@ -1372,7 +1435,7 @@ class ConfigGUI(tk.Tk):
         self.label_language.config(text=texts["Set Language:"])
         # Update run mode labels & combobox values
         self.label_run_mode.config(text=texts.get("Run Mode:", "Run Mode:"))
-        localized_run_vals = [texts.get("Local Viewer", "Local Viewer"), texts.get("MJPEG Streamer", "MJPEG Streamer"), texts.get("Legacy Streamer", "Legacy Streamer"), texts.get("Upload Video", "Upload Video")]
+        localized_run_vals = [texts.get("Local Viewer", "Local Viewer"), texts.get("MJPEG Streamer", "MJPEG Streamer"), texts.get("Legacy Streamer", "Legacy Streamer"), texts.get("Upload Video", "Upload Video"), texts.get("Single Image", "Single Image")]
         if OS_NAME == "Windows":
             localized_run_vals.append(texts.get("RTMP Streamer", "RTMP Streamer"))
             localized_run_vals.append(texts.get("3D Monitor", "3D Monitor"))
@@ -1388,6 +1451,8 @@ class ConfigGUI(tk.Tk):
         # Update video path label
         self.label_video_path.config(text=texts.get("Video Path:", "Video Path:"))
         self.btn_browse_video.config(text=texts.get("Browse Video...", "Browse Video..."))
+        self.label_image_path.config(text=texts.get("Image Path:", "Image Path:"))
+        self.btn_browse_image.config(text=texts.get("Browse Image...", "Browse Image..."))
         # Select the appropriate label
         if self.run_mode_key == "Local Viewer":
             self.run_mode_var_label.set(localized_run_vals[0])
@@ -1398,16 +1463,18 @@ class ConfigGUI(tk.Tk):
             self.run_mode_var_label.set(localized_run_vals[2])
         elif self.run_mode_key == "Upload Video":
             self.run_mode_var_label.set(localized_run_vals[3])
+        elif self.run_mode_key == "Single Image":
+            self.run_mode_var_label.set(localized_run_vals[4])
         if OS_NAME == "Windows":
             if self.run_mode_key == "RTMP Streamer":
-                self.run_mode_var_label.set(localized_run_vals[4])
-            elif self.run_mode_key == "3D Monitor":
                 self.run_mode_var_label.set(localized_run_vals[5])
+            elif self.run_mode_key == "3D Monitor":
+                self.run_mode_var_label.set(localized_run_vals[6])
                 self.fixed_viwer_aspect_cb.config(text=texts.get("Fix Viewer Aspect", "Fix Viewer Aspect"))
         # elif OS_NAME == "Darwin":
         else:
             if self.run_mode_key == "RTMP Streamer":
-                self.run_mode_var_label.set(localized_run_vals[4])
+                self.run_mode_var_label.set(localized_run_vals[5])
             
         self.fill_16_9_cb.config(text=texts.get("Fill 16:9", "Fill 16:9"))
             
@@ -1482,11 +1549,13 @@ class ConfigGUI(tk.Tk):
         rtmp_label = texts.get("RTMP Streamer", "RTMP Streamer")
         monitor3d_label = texts.get("3D Monitor", "3D Monitor")
         upload_video_label = texts.get("Upload Video", "Upload Video")
+        single_image_label = texts.get("Single Image", "Single Image")
         
         # Hide all streamer-specific controls first
         self.hide_all_streamer_controls()
         # Hide video upload controls by default
         self.hide_video_upload_controls()
+        self.hide_image_upload_controls()
         
         if label == mjpeg_label:
             self.run_mode_key = "MJPEG Streamer"
@@ -1506,6 +1575,9 @@ class ConfigGUI(tk.Tk):
         elif label == upload_video_label:
             self.run_mode_key = "Upload Video"
             self.show_video_upload_controls()
+        elif label == single_image_label:
+            self.run_mode_key = "Single Image"
+            self.show_image_upload_controls()
         
         # Update display mode options based on run mode
         self.update_display_mode_options()
@@ -1818,6 +1890,8 @@ class ConfigGUI(tk.Tk):
         # Video path (for Upload Video mode)
         video_path = cfg.get("Video Path", DEFAULTS.get("Video Path", ""))
         self.video_path_var.set(video_path)
+        image_path = cfg.get("Image Path", DEFAULTS.get("Image Path", ""))
+        self.image_path_var.set(image_path)
         
         # Update stream URL
         self.update_stream_url()
@@ -1920,7 +1994,7 @@ class ConfigGUI(tk.Tk):
             return
 
         # Check if window title exists when in Window capture mode
-        if self.capture_mode_key == "Window" and self.run_mode_key != "Upload Video":
+        if self.capture_mode_key == "Window" and self.run_mode_key not in {"Upload Video", "Single Image"}:
             window_title = self.selected_window_name
             if not window_title:
                 messagebox.showerror(
@@ -1946,6 +2020,16 @@ class ConfigGUI(tk.Tk):
                 messagebox.showerror(
                     UI_TEXTS[self.language]["Error"],
                     UI_TEXTS[self.language].get("Please select a video file", "Please select a video file before running")
+                )
+                return
+
+        if self.run_mode_key == "Single Image":
+            image_path = self.image_path_var.get()
+            valid_exts = {".png", ".jpg", ".jpeg"}
+            if not image_path or not os.path.exists(image_path) or os.path.splitext(image_path)[1].lower() not in valid_exts:
+                messagebox.showerror(
+                    UI_TEXTS[self.language]["Error"],
+                    UI_TEXTS[self.language].get("Please select an image file", "Please select an image file before running")
                 )
                 return
 
@@ -1992,6 +2076,7 @@ class ConfigGUI(tk.Tk):
             "Specify Display": self.specify_display_var.get(),
             "Stereo Monitor": self.monitor_label_to_index.get(self.stereo_monitor_var.get(), DEFAULTS["Stereo Monitor"]),
             "Video Path": self.video_path_var.get(),
+            "Image Path": self.image_path_var.get(),
         }
         
         success = self.save_yaml("settings.yaml", self.cfg)

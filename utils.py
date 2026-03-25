@@ -203,6 +203,7 @@ IPD = settings["IPD"]
 CAPTURE_MODE = settings["Capture Mode"]
 WINDOW_TITLE = settings["Window Title"]
 VIDEO_PATH = settings.get("Video Path", "")
+IMAGE_PATH = settings.get("Image Path", "")
 
 # Image Processing Parameters
 FOREGROUND_SCALE = settings["Foreground Scale"] / 10 # 0-10
@@ -247,6 +248,9 @@ elif RUN_MODE == "RTMP Streamer":
 elif RUN_MODE == "Upload Video":
     RUN_MODE = "Viewer"
     CAPTURE_MODE = "Video"
+elif RUN_MODE == "Single Image":
+    RUN_MODE = "Viewer"
+    CAPTURE_MODE = "Image"
 else:
     RUN_MODE = "Streamer"
 

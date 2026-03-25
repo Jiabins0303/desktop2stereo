@@ -390,7 +390,8 @@ Model List:
   apple/DepthPro-hf:
     resolutions:
     - 1536
-Depth Model: C:/Users/jiabi/Downloads/distill_any_depth_qat_qdq.onnx
+Depth Model: C:/Users/jiabi/Downloads/small_model-20260216T020237Z-1-001/small_model/distill_any_depth_qat_qdq
+  (2).onnx
 Depth Strength: 2.0
 Anti-aliasing: 1
 Foreground Scale: 0.5
@@ -400,7 +401,7 @@ Download Path: models
 HF Endpoint: https://huggingface.co
 Computing Device: 0
 Language: EN
-Run Mode: Upload Video
+Run Mode: Single Image
 Stream Protocol: HLS
 Streamer Port: 1122
 Stream Quality: 100
@@ -408,7 +409,8 @@ torch.compile: false
 TensorRT: true
 Recompile TensorRT: false
 Use ONNX: true
-ONNX Model Path: C:/Users/jiabi/Downloads/distill_any_depth_qat_qdq.onnx
+ONNX Model Path: C:/Users/jiabi/Downloads/small_model-20260216T020237Z-1-001/small_model/distill_any_depth_qat_qdq
+  (2).onnx
 Unlock Thread (Legacy Streamer): false
 Capture Tool: DXCamera
 Fill 16:9: true
@@ -420,4 +422,5 @@ CRF: 20
 Audio Delay: -0.15
 Specify Display: false
 Stereo Monitor: 1
-Video Path: C:/Users/jiabi/Downloads/5741489-uhd_3840_2160_25fps.mp4
+Video Path: C:/Users/jiabi/Downloads/14189673_3840_2160_60fps.mp4
+Image Path: C:/Users/jiabi/Downloads/test.jpg

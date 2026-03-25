@@ -7,7 +7,7 @@ import signal
 import sys
 import subprocess
 import cv2
-from utils import OS_NAME, OUTPUT_RESOLUTION, DISPLAY_MODE, CAPTURE_MODE, CAPTURE_TOOL, MONITOR_INDEX, SHOW_FPS, FPS, WINDOW_TITLE, IPD, DEPTH_STRENGTH, RUN_MODE, STREAM_MODE, STREAM_PORT, STREAM_QUALITY, DML_BOOST, STEREOMIX_DEVICE, STREAM_KEY, AUDIO_DELAY, CRF, LOSSLESS_SCALING_SUPPORT, VIDEO_PATH, shutdown_event
+from utils import OS_NAME, OUTPUT_RESOLUTION, DISPLAY_MODE, CAPTURE_MODE, CAPTURE_TOOL, MONITOR_INDEX, SHOW_FPS, FPS, WINDOW_TITLE, IPD, DEPTH_STRENGTH, RUN_MODE, STREAM_MODE, STREAM_PORT, STREAM_QUALITY, DML_BOOST, STEREOMIX_DEVICE, STREAM_KEY, AUDIO_DELAY, CRF, LOSSLESS_SCALING_SUPPORT, VIDEO_PATH, IMAGE_PATH, shutdown_event
 from depth import process, predict_depth
 
 # Global process references
@@ -195,6 +195,36 @@ def video_capture_loop():
     
     cap.release()
     print("[Video] Capture loop finished")
+
+
+def run_single_image():
+    """Process one image, save depth/left/right/SBS outputs, then exit."""
+    if not IMAGE_PATH:
+        raise ValueError("No image path specified")
+
+    frame_bgr = cv2.imread(IMAGE_PATH, cv2.IMREAD_COLOR)
+    if frame_bgr is None:
+        raise FileNotFoundError(f"Failed to open image: {IMAGE_PATH}")
+
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    frame_rgb = process(frame_rgb, OUTPUT_RESOLUTION)
+
+    from depth import save_image_outputs
+
+    depth, rgb = predict_depth(frame_rgb, return_tuple=True, use_temporal_smooth=False)
+    export_display_mode = DISPLAY_MODE if DISPLAY_MODE != "Depth Map" else "Half-SBS"
+    output_paths = save_image_outputs(
+        IMAGE_PATH,
+        depth,
+        rgb,
+        ipd_uv=IPD,
+        depth_ratio=DEPTH_STRENGTH,
+        display_mode=export_display_mode,
+    )
+
+    print("[Main] Single image export completed")
+    for key, path in output_paths.items():
+        print(f"[Main] Saved {key}: {path}")
 
 def process_loop():
     while not shutdown_event.is_set():
@@ -826,6 +856,10 @@ def rtmp_stream(window):
     print("[RTMP] Stream thread exited.")
 
 def main(mode="Viewer"):
+    if CAPTURE_MODE == "Image":
+        run_single_image()
+        return
+
     # Start capture and processing threads
     if CAPTURE_MODE == "Video":
         threading.Thread(target=video_capture_loop, daemon=True).start()
