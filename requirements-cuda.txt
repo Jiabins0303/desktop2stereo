@@ -5,3 +5,5 @@ torchvision==0.22.1
 
 # torchaudio==2.7.1
 
+# ONNX Runtime GPU for direct ONNX model inference
+onnxruntime-gpu>=1.19.0

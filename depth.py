@@ -1,13 +1,21 @@
 # depth.py
 import torch
 torch.set_num_threads(1)
-from utils import DEVICE_ID, MODEL_ID, CACHE_PATH, FP16, DEPTH_RESOLUTION, AA_STRENGTH, FOREGROUND_SCALE, USE_TORCH_COMPILE, USE_TENSORRT, RECOMPILE_TRT, FILL_16_9, OS_NAME
+from utils import DEVICE_ID, MODEL_ID, CACHE_PATH, FP16, DEPTH_RESOLUTION, AA_STRENGTH, FOREGROUND_SCALE, USE_TORCH_COMPILE, USE_TENSORRT, RECOMPILE_TRT, FILL_16_9, OS_NAME, is_onnx_model, USE_ONNX, ONNX_MODEL_PATH
 import torch.nn.functional as F
 from transformers import AutoModelForDepthEstimation
 import numpy as np
 from threading import Lock
 import cv2
 import os, warnings
+
+# ONNX Runtime for direct ONNX model inference
+try:
+    import onnxruntime as ort
+    ONNXRUNTIME_AVAILABLE = True
+except ImportError:
+    ONNXRUNTIME_AVAILABLE = False
+    print("[Warning] onnxruntime not available. ONNX models will not be supported.")
 
 # Initialize DirectML Device
 def get_device(index=0):
@@ -275,16 +283,26 @@ def get_da3_model(model_id=MODEL_ID):
     return model.to(DEVICE)
 
 # TensorRT Optimization
-def optimize_with_tensorrt(onnx_path=ONNX_PATH, trt_path=TRT_PATH):
+def optimize_with_tensorrt(onnx_path=ONNX_PATH, trt_path=TRT_PATH, enable_int8=False):
     """
     Convert ONNX model to TensorRT engine using TensorRT's Python API only.
     Supports FP32, FP16, and INT8 precisions based on global flags.
-    Returns None if compilation fails.
+    
+    Args:
+        onnx_path: Path to the ONNX model file
+        trt_path: Path to save the TensorRT engine
+        enable_int8: Enable INT8 precision for QDQ models (no calibrator needed)
+    
+    Returns:
+        tuple: (trt_path, fixed_input_shape) where fixed_input_shape is a tuple (N,C,H,W)
+               for fixed-dimension models, or None for dynamic models.
+        Returns None if compilation fails.
     """
     try:
         if os.path.exists(trt_path) and RECOMPILE_TRT == False:
             print(f"Loaded existing TensorRT engine: {trt_path}")
-            return trt_path
+            # For cached engines, return None for shape - caller should get it from TensorRTEngine
+            return trt_path, None
         
         import tensorrt as trt
         
@@ -307,19 +325,84 @@ def optimize_with_tensorrt(onnx_path=ONNX_PATH, trt_path=TRT_PATH):
         # Set precision flags based on global configuration
         config.set_flag(trt.BuilderFlag.FP16)
         
+        # Enable INT8 for QDQ models - TensorRT reads quantization params from QDQ nodes
+        if enable_int8:
+            config.set_flag(trt.BuilderFlag.INT8)
+            print("[TensorRT] INT8 mode enabled for QDQ model")
+        
         # Set workspace memory (essential for all precision modes) 
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 << 30)  # 4 GB Workspace 
         
-        # Set dynamic shapes profile 
-        profile = builder.create_optimization_profile()
-        input_name = network.get_input(0).name
-        # Updated shape ranges to better match typical input sizes
-        min_shape = (1, 3, 224, 224)  # 224 = 14 * 16
-        opt_shape = (1, 3, (DEPTH_RESOLUTION//14)*14, (DEPTH_RESOLUTION//14)*14)
-        max_shape = (1, 3, 3920, 3920)  # 896 = 14 * 64
+        # Get input tensor info to detect fixed vs dynamic dimensions
+        input_tensor = network.get_input(0)
+        input_name = input_tensor.name
+        input_shape_raw = input_tensor.shape  # TensorRT Dims object
         
-        profile.set_shape(input_name, min_shape, opt_shape, max_shape)
-        config.add_optimization_profile(profile)
+        # Convert to list to properly handle TensorRT Dims object
+        input_shape = []
+        for i in range(len(input_shape_raw)):
+            dim_value = input_shape_raw[i]
+            input_shape.append(dim_value)
+        
+        # Debug: print the actual shape values
+        print(f"[TensorRT Debug] Input name: {input_name}")
+        print(f"[TensorRT Debug] Input shape: {input_shape}")
+        
+        # Check if input has any dynamic dimensions (-1)
+        has_dynamic_dims = any(dim == -1 for dim in input_shape)
+        
+        if has_dynamic_dims:
+            # Semi-dynamic or fully dynamic input: create optimization profile
+            # For dynamic dims (-1), use range; for fixed dims, use same value in min/opt/max
+            profile = builder.create_optimization_profile()
+            
+            # Build shapes respecting fixed vs dynamic dimensions
+            min_shape = []
+            opt_shape = []
+            max_shape = []
+            
+            for i, dim in enumerate(input_shape):
+                if dim == -1:
+                    # Dynamic dimension - use ranges
+                    if i == 0:
+                        # Batch dimension
+                        min_shape.append(1)
+                        opt_shape.append(1)
+                        max_shape.append(4)  # Reasonable max batch size
+                    elif i >= 2:
+                        # Spatial dimensions - if user has dynamic spatial dims
+                        min_shape.append(224)
+                        opt_shape.append((DEPTH_RESOLUTION//14)*14)
+                        max_shape.append(3920)
+                    else:
+                        # Channel dimension (rare to be dynamic)
+                        min_shape.append(3)
+                        opt_shape.append(3)
+                        max_shape.append(3)
+                else:
+                    # Fixed dimension - must use same value in min/opt/max
+                    min_shape.append(dim)
+                    opt_shape.append(dim)
+                    max_shape.append(dim)
+            
+            min_shape = tuple(min_shape)
+            opt_shape = tuple(opt_shape)
+            max_shape = tuple(max_shape)
+            
+            profile.set_shape(input_name, min_shape, opt_shape, max_shape)
+            config.add_optimization_profile(profile)
+            print(f"[TensorRT] Dynamic dims detected, profile: min={min_shape}, opt={opt_shape}, max={max_shape}")
+            
+            # For models with fixed spatial dims, store them
+            if len(input_shape) >= 4 and input_shape[2] > 0 and input_shape[3] > 0:
+                fixed_input_shape = tuple([1 if d == -1 else d for d in input_shape])
+                print(f"[TensorRT] Fixed spatial dimensions: {input_shape[2]}x{input_shape[3]}")
+            else:
+                fixed_input_shape = None
+        else:
+            # Fully fixed input: no optimization profile needed
+            print(f"[TensorRT] Fully fixed input shape: {input_shape}")
+            fixed_input_shape = tuple(input_shape)
         
         # Optional: Enable additional optimizations that work well with FP32 [5](@ref)
         # These optimizations can improve performance regardless of precision
@@ -336,7 +419,7 @@ def optimize_with_tensorrt(onnx_path=ONNX_PATH, trt_path=TRT_PATH):
             f.write(serialized_engine)
         
         print(f"[Main] TensorRT engine saved to {trt_path}")
-        return trt_path
+        return trt_path, fixed_input_shape
         
     except Exception as e:
         print(f"[Error] TensorRT optimization failed: {str(e)}")
@@ -379,6 +462,7 @@ class TensorRTEngine:
         """
         self.device = device
         self.dtype = dtype
+        self.input_shape = None  # Store input shape for fixed-dimension models
         
         try:
             import tensorrt as trt
@@ -392,18 +476,38 @@ class TensorRTEngine:
             self.engine = runtime.deserialize_cuda_engine(engine_data)
             self.context = self.engine.create_execution_context()
             
-            # Get binding information using names instead of deprecated methods
+            # Get binding information using TensorRT's tensor mode API
             self.input_binding_indices = []
             self.output_binding_indices = []
             
             for binding in range(self.engine.num_io_tensors):
                 name = self.engine.get_tensor_name(binding)
+                mode = self.engine.get_tensor_mode(name)
                 
-                # Use name pattern matching to identify inputs/outputs
-                if "input" in name.lower() or "pixel_values" in name.lower():
+                if mode == trt.TensorIOMode.INPUT:
                     self.input_binding_indices.append(binding)
                 else:
                     self.output_binding_indices.append(binding)
+            
+            # Store input name and shape (for fixed-dimension detection)
+            if self.input_binding_indices:
+                first_input_binding = self.input_binding_indices[0]
+                self.input_name = self.engine.get_tensor_name(first_input_binding)
+                # Get the input shape from the engine
+                engine_input_shape = tuple(self.engine.get_tensor_shape(self.input_name))
+                # Check if all dimensions are positive (fixed) or have -1 (dynamic)
+                if all(dim > 0 for dim in engine_input_shape):
+                    self.input_shape = engine_input_shape
+                    print(f"[TensorRT] Engine has fixed input shape: {self.input_shape}")
+            else:
+                raise RuntimeError("No input bindings found in TensorRT engine")
+            
+            # Store the actual output name (first output) for dynamic model support
+            if self.output_binding_indices:
+                first_output_binding = self.output_binding_indices[0]
+                self.output_name = self.engine.get_tensor_name(first_output_binding)
+            else:
+                raise RuntimeError("No output bindings found in TensorRT engine")
             
             # Pre-allocate output tensors
             self.output_shapes = {}
@@ -413,6 +517,15 @@ class TensorRTEngine:
             
         except ImportError:
             raise ImportError("TensorRT not available")
+    
+    def get_fixed_input_size(self):
+        """
+        Return the fixed input size (H, W) if the engine has fixed dimensions.
+        Returns None if the engine has dynamic dimensions.
+        """
+        if self.input_shape is not None and len(self.input_shape) == 4:
+            return (self.input_shape[2], self.input_shape[3])  # (H, W)
+        return None
 
     def __call__(self, tensor):
         """Execute inference with TensorRT using native API."""
@@ -440,15 +553,117 @@ class TensorRTEngine:
         # Execute inference
         self.context.execute_v2(bindings=bindings)
         
-        # Return the main output (predicted_depth)
-        return outputs['predicted_depth']
+        # Return the main output using detected name (supports different models)
+        return outputs[self.output_name]
+
+
+# ONNX Runtime Model Wrapper Class for GPU Inference
+# DEPRECATED: This class is no longer used. ONNX files are now compiled directly
+# to native TensorRT engines via _load_qdq_tensorrt_engine() for better INT8 support.
+# Kept for reference only.
+class ONNXModelWrapper:
+    """
+    DEPRECATED: Use native TensorRT via _load_qdq_tensorrt_engine() instead.
+    
+    This class used ONNX Runtime with TensorRT Execution Provider, but encountered
+    issues with INT8 QDQ models (HasExternalDataInMemory error). Native TensorRT
+    compilation provides better compatibility.
+    """
+    def __init__(self, onnx_path, device_id=0, dtype=torch.float32):
+        if not ONNXRUNTIME_AVAILABLE:
+            raise ImportError("onnxruntime-gpu is required. Install with: pip install onnxruntime-gpu")
+        
+        self.device_id = device_id
+        self.dtype = dtype
+        self.device = torch.device(f'cuda:{device_id}')
+        
+        # Engine cache directory (same folder as ONNX model)
+        cache_dir = os.path.dirname(os.path.abspath(onnx_path))
+        
+        # TensorRT EP options for INT8 QDQ models
+        providers = [
+            ('TensorrtExecutionProvider', {
+                'device_id': device_id,
+                'trt_max_workspace_size': 4 * 1024 * 1024 * 1024,  # 4GB
+                'trt_fp16_enable': True,
+                'trt_int8_enable': True,  # Critical for INT8 QDQ models
+                'trt_engine_cache_enable': True,
+                'trt_engine_cache_path': cache_dir,
+            }),
+            ('CUDAExecutionProvider', {'device_id': device_id}),  # Fallback
+        ]
+        
+        # Session options
+        sess_options = ort.SessionOptions()
+        sess_options.log_severity_level = 2  # WARNING level
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        
+        # Load model from file path (required for TRT engine caching)
+        print(f"[ONNX] Loading model: {onnx_path}")
+        print(f"[ONNX] TensorRT engine cache: {cache_dir}")
+        print(f"[ONNX] First run may take several minutes for TensorRT compilation...")
+        
+        self.session = ort.InferenceSession(onnx_path, sess_options=sess_options, providers=providers)
+        
+        # Check which provider is active
+        active_providers = self.session.get_providers()
+        if 'TensorrtExecutionProvider' in active_providers:
+            print(f"[ONNX] Running on TensorRT (INT8 enabled)")
+        elif 'CUDAExecutionProvider' in active_providers:
+            print(f"[ONNX] Running on CUDA (TensorRT unavailable)")
+        else:
+            raise RuntimeError(f"Failed to load on GPU. Active providers: {active_providers}")
+        
+        # Get input/output info
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
+        self.input_shape = self.session.get_inputs()[0].shape
+        
+        print(f"[ONNX] Input: {self.input_name}, Shape: {self.input_shape}")
+        print(f"[ONNX] Output: {self.output_name}")
+        
+        # Check for fixed input dimensions
+        self.has_fixed_input = all(isinstance(dim, int) for dim in self.input_shape)
+        if self.has_fixed_input:
+            self.fixed_h = self.input_shape[2]
+            self.fixed_w = self.input_shape[3]
+            print(f"[ONNX] Fixed input size: {self.fixed_h}x{self.fixed_w}")
+        else:
+            self.fixed_h = None
+            self.fixed_w = None
+    
+    def __call__(self, tensor):
+        """Run inference on GPU via ONNX Runtime."""
+        # Convert PyTorch tensor to numpy (ONNX Runtime handles GPU transfer)
+        input_np = tensor.cpu().numpy().astype(np.float32)
+        
+        # Run inference
+        outputs = self.session.run([self.output_name], {self.input_name: input_np})
+        
+        # Convert output back to PyTorch tensor on GPU
+        return torch.from_numpy(outputs[0]).to(device=self.device, dtype=self.dtype)
+    
+    def get_fixed_input_size(self):
+        """Return fixed input size if model has fixed dimensions."""
+        if self.has_fixed_input:
+            return (self.fixed_h, self.fixed_w)
+        return None
+    
+    def parameters(self):
+        """Compatibility method."""
+        return iter([torch.zeros(1)])
+    
+    def eval(self):
+        """Compatibility method."""
+        return self
+
 
 # Model Wrapper Class
 class DepthModelWrapper:
     def __init__(self, model_path, device, device_info, dtype, size=None,
                  onnx_path=ONNX_PATH, trt_path=TRT_PATH):
         """
-        Wrapper class that handles both PyTorch and TensorRT backends.
+        Wrapper class that handles PyTorch, ONNX, and TensorRT backends.
         """
         self.device = device
         self.device_info = device_info
@@ -458,10 +673,31 @@ class DepthModelWrapper:
         self.trt_path = trt_path
         self.size = size
         self.use_torch_compile = USE_TORCH_COMPILE
+        self.onnx_fixed_size = None  # Will store fixed input size for ONNX models
+        self.trt_fixed_size = None   # Will store fixed input size for QDQ TensorRT models
         
         # Determine backend based on device
         self.is_cuda = IS_CUDA
         
+        # Check if model_path is an ONNX file - use native TensorRT with INT8 support
+        if is_onnx_model(model_path):
+            if not self.is_cuda:
+                raise RuntimeError("ONNX models require CUDA/GPU. Please ensure a CUDA-capable device is available.")
+            
+            try:
+                # Use native TensorRT for QDQ ONNX models (better INT8 support than ONNX Runtime)
+                self.backend = "TensorRT"
+                self.is_qdq_model = True  # Flag to indicate this is a QDQ ONNX model compiled to TensorRT
+                self.model = self._load_qdq_tensorrt_engine(model_path)
+                if self.model is None:
+                    raise RuntimeError("Failed to compile QDQ ONNX to TensorRT engine")
+                print(f"Using backend: {self.backend} (QDQ INT8)")
+                return
+            except Exception as e:
+                print(f"[Error] QDQ TensorRT loading failed: {str(e)}")
+                raise
+        
+        # Standard PyTorch/TensorRT path
         if self.is_cuda and USE_TENSORRT:
             # Use TensorRT backend for CUDA
             warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
@@ -524,17 +760,66 @@ class DepthModelWrapper:
             export_to_onnx(pytorch_model, self.onnx_path, self.device, self.dtype)
         
         # Build or load TensorRT engine
-        trt_engine_path = optimize_with_tensorrt(self.onnx_path, self.trt_path)
-        if trt_engine_path is None:
+        result = optimize_with_tensorrt(self.onnx_path, self.trt_path)
+        if result is None:
             return None
+        
+        trt_engine_path, fixed_shape = result
+        
         try:
-            return TensorRTEngine(trt_engine_path, self.device, self.dtype)
+            engine = TensorRTEngine(trt_engine_path, self.device, self.dtype)
+            # Get fixed input size from engine (handles both cached and newly compiled)
+            fixed_size = engine.get_fixed_input_size()
+            if fixed_size is not None:
+                self.trt_fixed_size = fixed_size
+            return engine
+        except Exception as e:
+            print(f"[Error] TensorRT engine loading failed: {str(e)}")
+            return None
+    
+    def _load_qdq_tensorrt_engine(self, qdq_onnx_path):
+        """
+        Load TensorRT engine directly from QDQ ONNX model.
+        Skips PyTorch model loading and ONNX export - goes straight to TensorRT compilation.
+        
+        Args:
+            qdq_onnx_path: Path to the QDQ ONNX model file
+        
+        Returns:
+            TensorRTEngine instance or None if compilation fails
+        """
+        # Generate TRT path based on ONNX filename
+        base_name = os.path.splitext(os.path.basename(qdq_onnx_path))[0]
+        onnx_dir = os.path.dirname(os.path.abspath(qdq_onnx_path))
+        trt_path = os.path.join(onnx_dir, f"{base_name}_int8.trt")
+        
+        print(f"[TensorRT] Compiling QDQ ONNX to INT8 TensorRT engine...")
+        print(f"[TensorRT] Source: {qdq_onnx_path}")
+        print(f"[TensorRT] Target: {trt_path}")
+        
+        # Compile with INT8 enabled for QDQ models
+        result = optimize_with_tensorrt(qdq_onnx_path, trt_path, enable_int8=True)
+        if result is None:
+            print("[Error] Failed to compile QDQ ONNX to TensorRT")
+            return None
+        
+        engine_path, fixed_shape = result
+        
+        try:
+            engine = TensorRTEngine(engine_path, self.device, self.dtype)
+            # Get fixed input size from engine (handles both cached and newly compiled)
+            fixed_size = engine.get_fixed_input_size()
+            if fixed_size is not None:
+                self.trt_fixed_size = fixed_size
+                print(f"[TensorRT] Model requires fixed input: {self.trt_fixed_size}")
+            return engine
         except Exception as e:
             print(f"[Error] TensorRT engine loading failed: {str(e)}")
             return None
     
     def __call__(self, tensor):
         """Run inference using the active backend."""
+        # PyTorch and TensorRT backends (ONNX files are now compiled to TensorRT)
         if self.is_cuda:
             with torch.inference_mode():
                 with torch.amp.autocast('cuda'):
@@ -545,6 +830,7 @@ class DepthModelWrapper:
                             return self.model.predict_depth(tensor)
                         return self.model(pixel_values=tensor).predicted_depth
                     else:
+                        # TensorRT backend
                         return self.model(tensor)
         else:
             with torch.no_grad():
@@ -628,30 +914,44 @@ depth_stabilizer = DepthStabilizer(alpha=0.9)  # increase alpha for more stabili
 if USE_TORCH_COMPILE and IS_CUDA:
     depth_stabilizer.__call__ = torch.compile(depth_stabilizer.__call__, fullgraph=True)
 
-# Modified predict_depth function with improved TRT integration
+# Modified predict_depth function with improved TRT and ONNX integration
 def predict_depth(image_rgb: np.ndarray, return_tuple=False, use_temporal_smooth: bool = True):
     """
     Returns depth in [0,1], where 1 = near, 0 = far.
     Optionally returns (depth_tensor [H,W], rgb_c [C,H,W]) if return_tuple=True.
     
     Optimized: All resizing and normalization done on GPU for maximum performance.
+    Supports PyTorch, TensorRT, and ONNX backends.
     """
     h, w = image_rgb.shape[:2]
     
-    # Compute target size: scale shortest edge to DEPTH_RESOLUTION, preserve aspect ratio
-    scale = DEPTH_RESOLUTION / min(h, w)
-    target_h, target_w = int(round(h * scale)), int(round(w * scale))
+    # Check if using fixed input size (ONNX or TensorRT with QDQ model)
+    is_qdq_model = getattr(model_wraper, 'is_qdq_model', False)
+    onnx_fixed_size = getattr(model_wraper, 'onnx_fixed_size', None)
+    trt_fixed_size = getattr(model_wraper, 'trt_fixed_size', None)
     
-    # Ensure dimensions divisible by 14 for ViT-based models (Depth Anything, etc.)
-    if "anything" in MODEL_ID.lower():
-        target_h = (target_h // 14) * 14
-        target_w = (target_w // 14) * 14
-        # Special case: Video-Depth-Anything expects fixed square input
-        if "video-depth-anything" in MODEL_ID.lower():
-            target_h, target_w = DEPTH_RESOLUTION, DEPTH_RESOLUTION
+    # Compute target size based on backend
+    if is_qdq_model and onnx_fixed_size is not None:
+        # QDQ ONNX model with fixed input dimensions - use those
+        target_h, target_w = onnx_fixed_size
+    elif trt_fixed_size is not None:
+        # QDQ TensorRT model with fixed input dimensions
+        target_h, target_w = trt_fixed_size
     else:
-        # Fixed square input for other models (e.g., DepthPro, DPT)
-        target_h, target_w = DEPTH_RESOLUTION, DEPTH_RESOLUTION
+        # Standard size computation
+        scale = DEPTH_RESOLUTION / min(h, w)
+        target_h, target_w = int(round(h * scale)), int(round(w * scale))
+        
+        # Ensure dimensions divisible by 14 for ViT-based models (Depth Anything, etc.)
+        if "anything" in MODEL_ID.lower():
+            target_h = (target_h // 14) * 14
+            target_w = (target_w // 14) * 14
+            # Special case: Video-Depth-Anything expects fixed square input
+            if "video-depth-anything" in MODEL_ID.lower():
+                target_h, target_w = DEPTH_RESOLUTION, DEPTH_RESOLUTION
+        else:
+            # Fixed square input for other models (e.g., DepthPro, DPT)
+            target_h, target_w = DEPTH_RESOLUTION, DEPTH_RESOLUTION
 
     # EARLY GPU TRANSFER + FULL GPU PREPROCESSING
     # Convert NumPy -> Torch tensor and move to device early
@@ -675,10 +975,19 @@ def predict_depth(image_rgb: np.ndarray, return_tuple=False, use_temporal_smooth
 
     # Normalize using ImageNet stats (or custom) — on GPU
     tensor = (tensor - MEAN) / STD
-    tensor = tensor.to(dtype=MODEL_DTYPE).contiguous()
+    
+    # For QDQ TensorRT models (from ONNX), keep float32; for others, use MODEL_DTYPE
+    if is_qdq_model:
+        tensor = tensor.to(dtype=torch.float32).contiguous()
+    else:
+        tensor = tensor.to(dtype=MODEL_DTYPE).contiguous()
 
     # MODEL INFERENCE
-    if "video-depth-anything" in MODEL_ID.lower():
+    if is_qdq_model:
+        # QDQ TensorRT model - direct call with inference mode
+        with torch.inference_mode():
+            depth = model_wraper(tensor)
+    elif "video-depth-anything" in MODEL_ID.lower():
         with torch.no_grad():
             depth = model_wraper(tensor)
     else:
@@ -792,24 +1101,39 @@ def overlay_fps(rgb: torch.Tensor, fps: float):
     return rgb * (1 - alpha) + color * alpha
 
 
-# generate left and right eye view for streamer 
-def make_sbs_core(rgb: torch.Tensor,
-                  depth: torch.Tensor,
-                  ipd_uv=0.064,
-                  depth_ratio=1.0,
-                  display_mode="Half-SBS",
-                  fill_16_9=FILL_16_9,
-                  device=DEVICE) -> torch.Tensor:
-    """
-    Core tensor operations for side-by-side stereo.
-    Keeps CUDA fast path (grid_sample) and fallback path (gather).
-    Compatible with torch.compile.
-    Inputs:
-        rgb: [C,H,W] float tensor
-        depth: [H,W] float tensor
-    Returns:
-        SBS image [C,H,W] float tensor (0-255 range)
-    """
+def _coerce_rgb_tensor(rgb_c, depth: torch.Tensor) -> torch.Tensor:
+    """Convert input RGB to CHW tensor on the same device/dtype as depth."""
+    if isinstance(rgb_c, np.ndarray):
+        rgb = torch.from_numpy(rgb_c).to(device=depth.device, dtype=depth.dtype)
+        if rgb.ndim == 3 and rgb.shape[2] == 3:
+            rgb = rgb.permute(2, 0, 1)
+    else:
+        rgb = rgb_c.to(device=depth.device, dtype=depth.dtype)
+    return rgb
+
+
+def _pad_to_aspect_tensor(tensor, target_ratio=(16, 9)):
+    _, h, w = tensor.shape
+    t_w, t_h = target_ratio
+    r_img, r_t = w / h, t_w / t_h
+    if abs(r_img - r_t) < 1e-3:
+        return tensor
+    if r_img > r_t:  # too wide -> pad height
+        new_h = int(round(w / r_t))
+        pad_top = (new_h - h) // 2
+        return F.pad(tensor, (0, 0, pad_top, new_h - h - pad_top))
+    new_w = int(round(h * r_t))
+    pad_left = (new_w - w) // 2
+    return F.pad(tensor, (pad_left, new_w - w - pad_left, 0, 0))
+
+
+def _generate_stereo_pair_core(rgb: torch.Tensor,
+                               depth: torch.Tensor,
+                               ipd_uv=0.064,
+                               depth_ratio=1.0,
+                               fill_16_9=FILL_16_9,
+                               device=DEVICE):
+    """Return left/right eye tensors in 0-255 range."""
     # Cast to float32 for DirectML compatibility (avoids float64 ops)
     if IS_DIRECTML:
         rgb = rgb.to(dtype=torch.float32, device=device)
@@ -831,7 +1155,7 @@ def make_sbs_core(rgb: torch.Tensor,
         grid_left = torch.stack([xs + shift_norm, ys], dim=-1)
         grid_right = torch.stack([xs - shift_norm, ys], dim=-1)
         if IS_MPS:
-            grid_left, grid_right = grid_right.clamp(-1,1), grid_right.clamp(-1,1)
+            grid_left, grid_right = grid_left.clamp(-1,1), grid_right.clamp(-1,1)
             left = F.grid_sample(img, grid_left, mode="bilinear",
                                 padding_mode="zeros", align_corners=False)[0]
             right = F.grid_sample(img, grid_right, mode="bilinear",
@@ -854,27 +1178,14 @@ def make_sbs_core(rgb: torch.Tensor,
         # Right eye
         gather_idx_right = coords_right.unsqueeze(0).expand(C, H, W).unsqueeze(0)
         right = torch.gather(img.expand(1, C, H, W), 3, gather_idx_right)[0]
-    
-    # Aspect pad helper
-    def pad_to_aspect_tensor(tensor, target_ratio=(16, 9)):
-        _, h, w = tensor.shape
-        t_w, t_h = target_ratio
-        r_img, r_t = w / h, t_w / t_h
-        if abs(r_img - r_t) < 1e-3:
-            return tensor
-        if r_img > r_t:  # too wide -> pad height
-            new_h = int(round(w / r_t))
-            pad_top = (new_h - h) // 2
-            return F.pad(tensor, (0, 0, pad_top, new_h - h - pad_top))
-        else:  # too tall -> pad width
-            new_w = int(round(h * r_t))
-            pad_left = (new_w - w) // 2
-            return F.pad(tensor, (pad_left, new_w - w - pad_left, 0, 0))
-    
-    # Aspect pad & arrange SBS/TAB
+
     if fill_16_9:
-        left = pad_to_aspect_tensor(left)
-        right = pad_to_aspect_tensor(right)
+        left = _pad_to_aspect_tensor(left)
+        right = _pad_to_aspect_tensor(right)
+    return left.clamp(0, 255), right.clamp(0, 255)
+
+
+def _arrange_stereo_output(left: torch.Tensor, right: torch.Tensor, display_mode="Half-SBS") -> torch.Tensor:
     if display_mode == "TAB":
         out = torch.cat([left, right], dim=1)
     else:
@@ -883,6 +1194,39 @@ def make_sbs_core(rgb: torch.Tensor,
         out = F.interpolate(out.unsqueeze(0), size=left.shape[1:], mode="area")[0]
     return out.clamp(0, 255)
 
+
+def _tensor_to_uint8_hwc(tensor: torch.Tensor) -> np.ndarray:
+    return tensor.to(torch.uint8).permute(1, 2, 0).contiguous().cpu().numpy()
+
+
+def depth_to_image(depth) -> np.ndarray:
+    """Convert normalized depth to an 8-bit grayscale image."""
+    if hasattr(depth, "detach"):
+        return depth.detach().clamp(0, 1).mul(255).round().to(torch.uint8).cpu().numpy()
+    depth_arr = np.asarray(depth, dtype=np.float32)
+    return np.clip(np.rint(depth_arr * 255.0), 0, 255).astype(np.uint8)
+
+
+def make_sbs_core(rgb: torch.Tensor,
+                  depth: torch.Tensor,
+                  ipd_uv=0.064,
+                  depth_ratio=1.0,
+                  display_mode="Half-SBS",
+                  fill_16_9=FILL_16_9,
+                  device=DEVICE) -> torch.Tensor:
+    """
+    Core tensor operations for side-by-side stereo.
+    Keeps CUDA fast path (grid_sample) and fallback path (gather).
+    Compatible with torch.compile.
+    Inputs:
+        rgb: [C,H,W] float tensor
+        depth: [H,W] float tensor
+    Returns:
+        SBS image [C,H,W] float tensor (0-255 range)
+    """
+    left, right = _generate_stereo_pair_core(rgb, depth, ipd_uv, depth_ratio, fill_16_9, device)
+    return _arrange_stereo_output(left, right, display_mode)
+
 def make_sbs(rgb_c, depth, ipd_uv=0.064, depth_ratio=1.0, display_mode="Half-SBS", fps=None):
     """
     Full function: adds optional FPS overlay and converts output to numpy uint8.
@@ -890,24 +1234,65 @@ def make_sbs(rgb_c, depth, ipd_uv=0.064, depth_ratio=1.0, display_mode="Half-SBS
     """
     if depth.dim() == 3 and depth.shape[0] == 1:
         depth = depth[0]
-        
-    # Handle input type conversion
-    if isinstance(rgb_c, np.ndarray):
-        # Convert numpy array to tensor with matching device/dtype
-        rgb = torch.from_numpy(rgb_c).to(device=depth.device, dtype=depth.dtype)
-        # Convert from HWC to CHW format
-        if rgb.ndim == 3 and rgb.shape[2] == 3:
-            rgb = rgb.permute(2, 0, 1)
-    else:
-        # Ensure tensor is on correct device and dtype
-        rgb = rgb_c.to(device=depth.device, dtype=depth.dtype)
+    rgb = _coerce_rgb_tensor(rgb_c, depth)
 
     # Optional FPS overlay can stay in Python side (avoids torch.compile recompiles)
     if fps is not None:
         rgb = overlay_fps(rgb, fps)  # your existing overlay function
 
     sbs_tensor = make_sbs_core(rgb, depth, ipd_uv, depth_ratio, display_mode)
-    return sbs_tensor.to(torch.uint8).permute(1,2,0).contiguous().cpu().numpy()
+    return _tensor_to_uint8_hwc(sbs_tensor)
+
+
+def make_stereo_views(rgb_c, depth, ipd_uv=0.064, depth_ratio=1.0, display_mode="Half-SBS", fps=None):
+    """Return left, right, and SBS images as uint8 numpy arrays."""
+    if depth.dim() == 3 and depth.shape[0] == 1:
+        depth = depth[0]
+    rgb = _coerce_rgb_tensor(rgb_c, depth)
+    if fps is not None:
+        rgb = overlay_fps(rgb, fps)
+    left, right = _generate_stereo_pair_core(rgb, depth, ipd_uv, depth_ratio)
+    sbs = _arrange_stereo_output(left, right, display_mode)
+    return _tensor_to_uint8_hwc(left), _tensor_to_uint8_hwc(right), _tensor_to_uint8_hwc(sbs)
+
+
+def _save_image_array(path: str, image: np.ndarray):
+    image = np.ascontiguousarray(image)
+    if image.ndim == 2:
+        ok = cv2.imwrite(path, image)
+    else:
+        ok = cv2.imwrite(path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+    if not ok:
+        raise OSError(f"Failed to save image: {path}")
+
+
+def save_image_outputs(input_path: str,
+                       depth,
+                       rgb_c,
+                       ipd_uv=0.064,
+                       depth_ratio=1.0,
+                       display_mode="Half-SBS") -> dict:
+    """Save depth, left, right, and SBS images next to the input image."""
+    base_path, _ = os.path.splitext(input_path)
+    depth_img = depth_to_image(depth)
+    left_img, right_img, sbs_img = make_stereo_views(
+        rgb_c,
+        depth,
+        ipd_uv=ipd_uv,
+        depth_ratio=depth_ratio,
+        display_mode=display_mode,
+    )
+    output_paths = {
+        "depth": f"{base_path}_depth.png",
+        "left": f"{base_path}_left.png",
+        "right": f"{base_path}_right.png",
+        "sbs": f"{base_path}_sbs.png",
+    }
+    _save_image_array(output_paths["depth"], depth_img)
+    _save_image_array(output_paths["left"], left_img)
+    _save_image_array(output_paths["right"], right_img)
+    _save_image_array(output_paths["sbs"], sbs_img)
+    return output_paths
 
 if USE_TORCH_COMPILE and IS_CUDA:
     make_sbs_core = torch.compile(make_sbs_core)

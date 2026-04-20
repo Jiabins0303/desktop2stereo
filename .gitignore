@@ -21,3 +21,4 @@ rtmp
 Python31*
 *Identifier*
 rocm*
+models/distill_any_depth_int8_optimized.onnx

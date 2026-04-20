@@ -32,8 +32,15 @@ DISABLE_TRT_KEYWORDS = [
     "da3", 
     "dpt",
     "zoedepth",
-    "depthpro"
+    "depthpro",
+    # Note: .onnx files now USE native TensorRT via _load_qdq_tensorrt_engine()
 ]
+
+def is_onnx_model(model_path: str) -> bool:
+    """Check if the model path points to an ONNX model file."""
+    if model_path is None:
+        return False
+    return str(model_path).lower().endswith('.onnx')
 
 # Global shutdown event
 shutdown_event = threading.Event()
@@ -195,6 +202,8 @@ SHOW_FPS, FPS, DEPTH_STRENGTH = settings["Show FPS"], settings["FPS"], settings[
 IPD = settings["IPD"]
 CAPTURE_MODE = settings["Capture Mode"]
 WINDOW_TITLE = settings["Window Title"]
+VIDEO_PATH = settings.get("Video Path", "")
+IMAGE_PATH = settings.get("Image Path", "")
 
 # Image Processing Parameters
 FOREGROUND_SCALE = settings["Foreground Scale"] / 10 # 0-10
@@ -213,6 +222,14 @@ STREAM_KEY = settings["Stream Key"]
 AUDIO_DELAY = settings["Audio Delay"]
 CRF = settings["CRF"]
 
+# ONNX Model Settings
+# ONNX models (especially INT8 QDQ) are compiled to native TensorRT for inference
+USE_ONNX = settings.get("Use ONNX", False)  # Enable ONNX model path
+ONNX_MODEL_PATH = settings.get("ONNX Model Path", "")  # Path to custom ONNX model file
+# If ONNX model path is set and valid, use it as MODEL_ID
+if USE_ONNX and ONNX_MODEL_PATH and is_onnx_model(ONNX_MODEL_PATH):
+    MODEL_ID = ONNX_MODEL_PATH
+
 # Determin the run mode and stream mode
 if RUN_MODE == "Local Viewer":
     RUN_MODE = "Viewer"
@@ -228,6 +245,12 @@ elif RUN_MODE == "RTMP Streamer":
     if OS_NAME == "Windows":
         # Frame Generation Settings for RTMP, Local Viewer not requried
         LOSSLESS_SCALING_SUPPORT = settings["Lossless Scaling Support"]
+elif RUN_MODE == "Upload Video":
+    RUN_MODE = "Viewer"
+    CAPTURE_MODE = "Video"
+elif RUN_MODE == "Single Image":
+    RUN_MODE = "Viewer"
+    CAPTURE_MODE = "Image"
 else:
     RUN_MODE = "Streamer"
 
